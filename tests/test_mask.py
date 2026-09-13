@@ -77,9 +77,16 @@ def test_equal_area_layout(client):
 
 def test_custom_weights_layout(client):
     body = create_scheme(
-        client, weighting="custom", weights=[3.0, 2.0, 2.0, 1.5, 1.5], bridge_width=7.0
+        client, weighting="custom", weights=[3.0, 2.0, 2.0, 1.5, 1.5], bridge_width=3.0
     )
     lay = version_detail(client, body["scheme"]["id"])["layout"]
+    # 宽内环带的窗高被限制在环带内（不再误报开窗相交），窗高为正、桥隙满足
+    for z in lay["zones"]:
+        assert z["window_height"] > 0
+        assert z["y_top"] <= z["outer_radius"] + 1e-9
+        assert z["y_bottom"] >= z["inner_radius"] - 1e-9
+    for br in lay["bridges"]:
+        assert br["gap"] >= 3.0 - 1e-9
     areas = [z["area"] for z in lay["zones"]]
     total_w = 10.0
     for a, w in zip(areas, [3.0, 2.0, 2.0, 1.5, 1.5]):
@@ -143,16 +150,30 @@ def test_reject_no_bridge(client):
     assert any("结构无法留桥" in e and "环带 0" in e for e in errors)
 
 
-def test_reject_window_overlap(client):
-    # 内环带过宽而桥宽太小：开窗顶边越出环带外边界
+def test_reject_insufficient_clearance(client):
+    # 等效半径距环带外边界 15.28mm < 桥宽 31mm 的一半余隙要求 → 窗高为零
     errors = reject_errors(
         client,
-        zone_count=3,
+        weighting="equal_width",
         center_exclusion_radius=20.0,
-        bridge_width=1.0,
+        zone_count=2,
+        bridge_width=31.0,
         min_zone_width=2.0,
     )
-    assert any("开窗相交" in e and "环带 0" in e for e in errors)
+    assert any("结构无法留桥" in e and "环带 0" in e for e in errors)
+
+
+def test_failed_scheme_leaves_no_orphan(client):
+    # 校验失败的请求不得留下任何方案数据
+    reject_errors(
+        client,
+        weighting="equal_width",
+        center_exclusion_radius=90.0,
+        zone_count=2,
+        bridge_width=6.0,
+        min_zone_width=2.0,
+    )
+    assert client.get("/api/mask-schemes").json()["schemes"] == []
 
 
 def test_reject_bad_weights(client):
@@ -292,10 +313,10 @@ SEARCH = {
     "source_mode": "fixed",
     "unit": "mm",
     "center_exclusion_radius": 25.0,
-    "min_zone_width": 4.0,
     "knife_resolution": 0.5,
     "zone_count_min": 4,
     "zone_count_max": 8,
+    "zone_width_min": 4.0,
     "bridge_width_min": 3.0,
     "bridge_width_max": 7.0,
     "bridge_width_step": 2.0,
@@ -307,7 +328,7 @@ def test_search_ranked_and_feasible(client):
     resp = client.post("/api/mask-schemes/search", json=SEARCH)
     assert resp.status_code == 200, resp.json()
     data = resp.json()
-    assert data["evaluated"] == 5 * 3 * 2  # 分区数 × 桥宽 × 权重模式
+    assert data["evaluated"] == 5 * 1 * 3 * 2  # 分区数 × 环宽 × 桥宽 × 权重模式
     assert data["feasible"] > 0
     cands = data["candidates"]
     assert len(cands) <= 5
@@ -334,6 +355,75 @@ def test_search_ranked_and_feasible(client):
     assert resp.status_code == 201, resp.json()
 
 
+def test_search_full_step_range_no_truncation(client):
+    # 桥宽 0.1–0.7 步长 0.001 → 601 个值全部参与评估，不静默截断
+    resp = client.post(
+        "/api/mask-schemes/search",
+        json={
+            **SEARCH,
+            "zone_count_min": 4,
+            "zone_count_max": 4,
+            "bridge_width_min": 0.1,
+            "bridge_width_max": 0.7,
+            "bridge_width_step": 0.001,
+            "layouts": ["equal_area"],
+            "top": 100,
+        },
+    )
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()
+    # 601 个桥宽值全部评估、全部可行并参与排序（修复前只评估 501 项）
+    assert data["evaluated"] == 601
+    assert data["feasible"] == 601
+    # 候选按桥宽升序连续覆盖（排名并列时制作余量决定次序，小桥宽窗更高）
+    bridges = [c["bridge_width"] for c in data["candidates"]]
+    assert bridges[0] == pytest.approx(0.1)
+    assert len(set(bridges)) == len(bridges)
+
+
+def test_search_zone_width_range(client):
+    # 环宽上下限 + 步长作为搜索维度
+    resp = client.post(
+        "/api/mask-schemes/search",
+        json={
+            **SEARCH,
+            "zone_count_min": 4,
+            "zone_count_max": 5,
+            "zone_width_min": 3.0,
+            "zone_width_max": 5.0,
+            "zone_width_step": 1.0,
+            "top": 50,
+        },
+    )
+    assert resp.status_code == 200, resp.json()
+    data = resp.json()
+    assert data["evaluated"] == 2 * 3 * 3 * 2  # 2 区数 × 3 环宽 × 3 桥宽 × 2 模式
+    widths = {c["params"]["min_zone_width"] for c in data["candidates"]}
+    assert widths == {3.0, 4.0, 5.0}
+    for c in data["candidates"]:
+        assert c["metrics"]["min_zone_width_mm"] >= c["min_zone_width"] - 1e-9
+
+
+def test_search_combo_limit_rejected(client):
+    # 组合数超限 → 明确 422，不静默漏算
+    resp = client.post(
+        "/api/mask-schemes/search",
+        json={
+            **SEARCH,
+            "zone_count_min": 2,
+            "zone_count_max": 100,
+            "zone_width_min": 0.5,
+            "zone_width_max": 10.0,
+            "zone_width_step": 0.01,
+            "bridge_width_min": 0.1,
+            "bridge_width_max": 0.7,
+            "bridge_width_step": 0.001,
+        },
+    )
+    assert resp.status_code == 422
+    assert "超出上限" in str(resp.json()["detail"])
+
+
 def test_search_rejects_bad_range(client):
     resp = client.post(
         "/api/mask-schemes/search", json={**SEARCH, "zone_count_max": 2, "zone_count_min": 5}
@@ -341,6 +431,11 @@ def test_search_rejects_bad_range(client):
     assert resp.status_code == 422
     resp = client.post(
         "/api/mask-schemes/search", json={**SEARCH, "center_exclusion_radius": 100.0}
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/mask-schemes/search",
+        json={**SEARCH, "zone_width_min": 5.0, "zone_width_max": 3.0},
     )
     assert resp.status_code == 422
 

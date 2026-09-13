@@ -5,19 +5,20 @@
 - 分区权重：equal_area（等面积）/ equal_width（等环宽）/ custom（自定义权重，
   各环带面积正比于权重）。
 - 环带等效半径 r_m = sqrt((r_in² + r_out²) / 2)（面积均分半径，与分析模型一致）。
-- 每环带开左右两个矩形窗：窗竖直方向以 r_m 为中心，窗高在满足
-  "相邻开窗间距 ≥ 桥宽" 且 "窗高 ≤ 环宽 - 桥宽" 的约束下取最大
-  （投影法求解）；窗水平方向由环带边界的弦长决定
-  （x_inner = sqrt(max(0, r_in² - y1²))，x_outer = sqrt(max(0, r_out² - y2²))，
+- 每环带开左右两个矩形窗：窗竖直方向以 r_m 为中心，窗高限制在所属环带内
+  且上下各留 ≥ 桥宽/2 的余隙，即 h = min(环宽 − 桥宽, 2·(r_out − r_m) − 桥宽)；
+  余隙保证相邻开窗间距 > 桥宽（无需再求解）。窗水平方向由环带边界的弦长
+  决定（x_inner = sqrt(max(0, r_in² - y1²))，x_outer = sqrt(max(0, r_out² - y2²))，
   y1/y2 为窗底/顶边高度）。内环带的窗底边高于 r_in 时 x_inner = 0，
   左右开窗在中心线处相连（梯式遮罩），属正常几何。
 
 拒绝生成（MaskError，错误逐条指明相关环带）：
 - 分区越界：中心禁测半径不小于镜面半径、权重非法等；
 - 环宽不足：环宽 < 最小环宽；
-- 结构无法留桥：环宽 ≤ 桥宽、相邻环带等效半径间距 < 桥宽，
-  或留桥约束下开窗高度被压为零；
-- 开窗相交：开窗顶/底边越出本环带边界（侵入相邻环带），或开窗水平宽度为零。
+- 结构无法留桥：环宽 ≤ 桥宽，或等效半径距环带外边界过近、
+  留出桥宽余隙后窗高为零；
+- 开窗相交：开窗越出本环带边界或水平宽度为零（余隙模型下正常参数
+  不会触发，保留作数值防御）。
 
 刀口位移预测：LA_ideal(r_m) = -K · r_m² / R（固定光源等效），移动光源的
 刀口位移减半（复用 optics.SOURCE_FACTOR / optics.ideal_la）；以最内环带为零点，
@@ -164,36 +165,6 @@ def validate_constants(p: MaskParams) -> list[str]:
     return errs
 
 
-def _window_heights(
-    widths: list[float], r_means: list[float], bridge_width: float
-) -> list[float]:
-    """求各环带开窗高度：以 r_m 为中心，在留桥约束下尽量开大。
-
-    约束：h_i <= 环宽_i - 桥宽（环带内留料），
-    h_i + h_{i+1} <= 2·(Δr_m,i - 桥宽)（相邻开窗间距 ≥ 桥宽）。
-    从上限出发对相邻约束循环投影（每步将超限的一对各削减超出量的一半），
-    收敛到可行解；调用方已保证 Δr_m,i >= 桥宽（零高度可行），
-    收敛后由调用方检查 h_i > 0。
-    """
-    n = len(widths)
-    h = [w - bridge_width for w in widths]
-    limits = [
-        2.0 * (r_means[i + 1] - r_means[i] - bridge_width) for i in range(n - 1)
-    ]
-    for _ in range(500):
-        violation = 0.0
-        for i, lim in enumerate(limits):
-            excess = h[i] + h[i + 1] - lim
-            if excess > 0.0:
-                cut = excess / 2.0
-                h[i] = max(0.0, h[i] - cut)
-                h[i + 1] = max(0.0, h[i + 1] - cut)
-                violation = max(violation, excess)
-        if violation < 1e-10:
-            break
-    return h
-
-
 def compute_layout(p: MaskParams) -> dict:
     """计算环带边界、等效半径、左右开窗与刀口位移预测。
 
@@ -238,35 +209,26 @@ def compute_layout(p: MaskParams) -> dict:
     if errs:
         raise MaskError(errs)
 
-    # 相邻环带等效半径间距必须容纳桥宽（开窗高度再小也无法绕过该约束）
+    # 开窗竖直范围：以 r_m 为中心，窗高限制在环带内且上下各留 ≥ 桥宽/2 余隙。
+    # 余隙使相邻开窗间距恒大于桥宽（y1 > r_in + b/2，y2 <= r_out - b/2）。
     errs = []
-    for i in range(n - 1):
-        d_rm = zones[i + 1]["r_mean"] - zones[i]["r_mean"]
-        if d_rm < b - TOL:
+    for z in zones:
+        label = f"环带 {z['index']}（{z['inner_radius']:.3f}~{z['outer_radius']:.3f} mm）"
+        clearance = 2.0 * (z["outer_radius"] - z["r_mean"]) - b
+        if clearance <= TOL:
             errs.append(
-                f"结构无法留桥：环带 {i} 与环带 {i + 1} 等效半径间距 "
-                f"{d_rm:.3f} < 桥宽 {b:g}"
+                f"结构无法留桥：{label} 等效半径距环带外边界 "
+                f"{z['outer_radius'] - z['r_mean']:.3f} mm，留出桥宽 {b:g} 余隙后窗高为零"
             )
-    if errs:
-        raise MaskError(errs)
-
-    # 开窗竖直范围：以 r_m 为中心，窗高在留桥约束下取最大（投影法）
-    heights = _window_heights(
-        [z["width"] for z in zones], [z["r_mean"] for z in zones], b
-    )
-    errs = []
-    for z, h in zip(zones, heights):
-        if h <= TOL:
-            errs.append(
-                f"结构无法留桥：环带 {z['index']} 在留桥约束下开窗高度为零"
-            )
+            continue
+        h = min(z["width"] - b, clearance)
         z["window_height"] = h
         z["y_bottom"] = z["r_mean"] - h / 2.0
         z["y_top"] = z["r_mean"] + h / 2.0
     if errs:
         raise MaskError(errs)
 
-    # 第二阶段：开窗不得越出本环带（侵入相邻环带即与相邻开窗/桥相交）
+    # 数值防御：余隙模型下开窗恒在环带内，以下检查正常参数不会触发
     errs = []
     for z in zones:
         label = f"环带 {z['index']}（{z['inner_radius']:.3f}~{z['outer_radius']:.3f} mm）"
@@ -405,60 +367,65 @@ def predict_knife(
 def search_layouts(
     base: MaskParams,
     zone_counts: list[int],
+    min_zone_widths: list[float],
     bridge_widths: list[float],
     layouts: list[str],
     top: int = 10,
 ) -> dict:
-    """在分区数 × 桥宽 × 权重模式范围内搜索可行布局并排序。
+    """在分区数 × 环宽 × 桥宽 × 权重模式范围内搜索可行布局并排序。
 
     排序准则（全部降序）：最小可分辨位移（相邻区对刀口位移差的最小值）、
     面积均衡度（最小/最大环带面积）、制作余量（最薄开窗高度）。
-    仅返回通过全部结构校验的候选；被否决的组合按类别计数说明。
+    完整评估给定范围内的全部组合（调用方负责组合数超限检查）；
+    仅返回通过全部结构校验的候选，被否决的组合按类别计数说明。
     """
     candidates = []
     evaluated = 0
     rejected: dict[str, int] = {}
     for layout_mode in layouts:
         for n in zone_counts:
-            for bw in bridge_widths:
-                p = replace(
-                    base,
-                    zone_count=int(n),
-                    bridge_width=float(bw),
-                    weighting=layout_mode,
-                    weights=None,
-                )
-                evaluated += 1
-                try:
-                    lay = compute_layout(p)
-                except MaskError as exc:
-                    for e in exc.errors:
-                        category = e.split("：", 1)[0]
-                        rejected[category] = rejected.get(category, 0) + 1
-                    continue
-                m = lay["metrics"]
-                candidates.append(
-                    {
-                        "weighting": layout_mode,
-                        "zone_count": int(n),
-                        "bridge_width": float(bw),
-                        "metrics": m,
-                        "zones": [
-                            {
-                                "index": z["index"],
-                                "inner_radius": z["inner_radius"],
-                                "outer_radius": z["outer_radius"],
-                                "r_mean": z["r_mean"],
-                                "width": z["width"],
-                            }
-                            for z in lay["zones"]
-                        ],
-                        "params": {
-                            **p.normalized(),
-                            "unit": "mm",
-                        },
-                    }
-                )
+            for mw in min_zone_widths:
+                for bw in bridge_widths:
+                    p = replace(
+                        base,
+                        zone_count=int(n),
+                        min_zone_width=float(mw),
+                        bridge_width=float(bw),
+                        weighting=layout_mode,
+                        weights=None,
+                    )
+                    evaluated += 1
+                    try:
+                        lay = compute_layout(p)
+                    except MaskError as exc:
+                        for e in exc.errors:
+                            category = e.split("：", 1)[0]
+                            rejected[category] = rejected.get(category, 0) + 1
+                        continue
+                    m = lay["metrics"]
+                    candidates.append(
+                        {
+                            "weighting": layout_mode,
+                            "zone_count": int(n),
+                            "min_zone_width": float(mw),
+                            "bridge_width": float(bw),
+                            "metrics": m,
+                            "zones": [
+                                {
+                                    "index": z["index"],
+                                    "inner_radius": z["inner_radius"],
+                                    "outer_radius": z["outer_radius"],
+                                    "r_mean": z["r_mean"],
+                                    "width": z["width"],
+                                }
+                                for z in lay["zones"]
+                            ],
+                            "params": {
+                                **p.normalized(),
+                                "unit": "mm",
+                            },
+                        }
+                    )
     candidates.sort(
         key=lambda c: (
             -(c["metrics"]["min_resolvable_delta_mm"] or 0.0),

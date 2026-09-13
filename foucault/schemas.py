@@ -128,7 +128,12 @@ class MaskSchemeCreateIn(MaskParamsIn):
 
 
 class MaskSearchIn(BaseModel):
-    """遮罩边界搜索：在分区数 × 桥宽 × 权重模式范围内枚举可行布局并排序。"""
+    """遮罩边界搜索：在分区数 × 环宽 × 桥宽 × 权重模式范围内枚举并排序。
+
+    环宽（最小环宽约束）与桥宽均为 [min, max] 范围：给 step 按步长取遍
+    （含端点，不截断）；缺省 max 时取单值 min；缺省 step 且 max > min 时
+    取 5 个等距点。组合总数超限时明确拒绝（422），不静默漏算。
+    """
 
     diameter: float
     radius_of_curvature: float
@@ -136,12 +141,14 @@ class MaskSearchIn(BaseModel):
     source_mode: SourceMode
     unit: Unit
     center_exclusion_radius: float = Field(ge=0)
-    min_zone_width: float = Field(gt=0)
     knife_resolution: float = Field(gt=0)
     zone_count_min: int = Field(ge=2, le=200)
     zone_count_max: int = Field(ge=2, le=200)
+    zone_width_min: float = Field(gt=0)
+    zone_width_max: float | None = Field(default=None, gt=0)
+    zone_width_step: float | None = Field(default=None, gt=0)
     bridge_width_min: float = Field(gt=0)
-    bridge_width_max: float = Field(gt=0)
+    bridge_width_max: float | None = Field(default=None, gt=0)
     bridge_width_step: float | None = Field(default=None, gt=0)
     layouts: list[SearchLayout] = Field(
         default_factory=lambda: ["equal_area", "equal_width"]

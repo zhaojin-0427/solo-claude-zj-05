@@ -44,6 +44,29 @@ from .storage import ConflictError, Database, NotFoundError
 
 DEFAULT_DB = os.environ.get("FOUCAULT_DB", "foucault.db")
 
+# 遮罩边界搜索的组合数上限（分区数 × 环宽 × 桥宽 × 权重模式），超限明确拒绝
+SEARCH_COMBO_LIMIT = 20000
+
+
+def _frange(lo: float, hi: float, step: float | None) -> list[float]:
+    """[lo, hi] 范围内按步长取值的完整序列（含端点，不截断）。
+
+    step 为 None：lo == hi 时取单值，否则取 5 个等距点。
+    """
+    if step is None:
+        if abs(hi - lo) < 1e-12:
+            return [lo]
+        return [lo + (hi - lo) * i / 4.0 for i in range(5)]
+    out = []
+    k = 0
+    while True:
+        v = lo + k * step  # 每次由起点计算，避免累加误差
+        if v > hi + 1e-9:
+            break
+        out.append(round(min(v, hi), 9))
+        k += 1
+    return out
+
 
 def _err(status: int, message: str, details: list | None = None) -> HTTPException:
     return HTTPException(
@@ -655,9 +678,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
             print_scale=p.print_scale,
         )
 
-    def _create_mask_version_idem(scheme_id: int, params: MaskParams) -> dict:
+    def _create_mask_version_idem(
+        scheme_id: int, params: MaskParams, layout: dict | None = None
+    ) -> dict:
         """计算布局并写入遮罩版本；参数与最新版本一致时复用（幂等）。"""
-        layout = compute_layout(params)  # MaskError → 422
+        if layout is None:
+            layout = compute_layout(params)  # MaskError → 422
         norm = params.normalized()
         params_hash = compute_input_hash(norm)
         try:
@@ -684,8 +710,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.post("/api/mask-schemes", status_code=201)
     def create_mask_scheme(payload: MaskSchemeCreateIn):
         params = _mask_params_of(payload)
+        # 先完成布局校验再落库：校验失败时不留下任何方案数据
+        layout = compute_layout(params)  # MaskError → 422
         scheme_id = db.create_mask_scheme(payload.name, payload.notes)
-        version = _create_mask_version_idem(scheme_id, params)
+        version = _create_mask_version_idem(scheme_id, params, layout)
         return {
             "scheme": db.get_mask_scheme(scheme_id),
             "version": _mask_version_brief(version),
@@ -699,23 +727,32 @@ def create_app(db_path: str | None = None) -> FastAPI:
     def search_mask(payload: MaskSearchIn):
         if payload.zone_count_max < payload.zone_count_min:
             raise _err(422, "zone_count_max 不能小于 zone_count_min")
-        if payload.bridge_width_max < payload.bridge_width_min:
+        bw_min = payload.bridge_width_min
+        bw_max = (
+            payload.bridge_width_max
+            if payload.bridge_width_max is not None
+            else bw_min
+        )
+        zw_min = payload.zone_width_min
+        zw_max = (
+            payload.zone_width_max if payload.zone_width_max is not None else zw_min
+        )
+        if bw_max < bw_min:
             raise _err(422, "bridge_width_max 不能小于 bridge_width_min")
+        if zw_max < zw_min:
+            raise _err(422, "zone_width_max 不能小于 zone_width_min")
         counts = list(range(payload.zone_count_min, payload.zone_count_max + 1))
-        bw_min, bw_max = payload.bridge_width_min, payload.bridge_width_max
-        if payload.bridge_width_step is not None:
-            bridges = []
-            v = bw_min
-            while v <= bw_max + 1e-9 and len(bridges) < 501:
-                bridges.append(round(v, 9))
-                v += payload.bridge_width_step
-        elif abs(bw_max - bw_min) < 1e-12:
-            bridges = [bw_min]
-        else:
-            bridges = [bw_min + (bw_max - bw_min) * i / 4.0 for i in range(5)]
-        combos = len(counts) * len(bridges) * len(payload.layouts)
-        if combos > 2000:
-            raise _err(422, f"搜索组合过多（{combos} > 2000），请缩小范围")
+        bridges = _frange(bw_min, bw_max, payload.bridge_width_step)
+        widths = _frange(zw_min, zw_max, payload.zone_width_step)
+        combos = (
+            len(counts) * len(widths) * len(bridges) * len(payload.layouts)
+        )
+        if combos > SEARCH_COMBO_LIMIT:
+            raise _err(
+                422,
+                f"搜索组合 {combos} 个超出上限 {SEARCH_COMBO_LIMIT}"
+                "（分区数 × 环宽 × 桥宽 × 权重模式），请缩小范围或增大步长",
+            )
         f = UNIT_TO_MM[payload.unit]
         base = MaskParams(
             diameter=payload.diameter * f,
@@ -726,7 +763,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             weighting="equal_area",
             weights=None,
             center_exclusion_radius=payload.center_exclusion_radius * f,
-            min_zone_width=payload.min_zone_width * f,
+            min_zone_width=zw_min * f,
             bridge_width=bw_min * f,
             knife_resolution=payload.knife_resolution * f,
             print_scale=1.0,
@@ -734,9 +771,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
         const_errs = validate_mask_constants(base)
         if const_errs:
             raise _err(422, "遮罩常量校验失败", const_errs)
-        bridges_mm = [b * f for b in bridges]
         result = search_layouts(
-            base, counts, bridges_mm, list(payload.layouts), top=payload.top
+            base,
+            counts,
+            [w * f for w in widths],
+            [b * f for b in bridges],
+            list(payload.layouts),
+            top=payload.top,
         )
         return result
 
