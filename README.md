@@ -52,6 +52,71 @@ python3 run.py                 # 或 uvicorn foucault.app:app
 | GET | `/api/mask-schemes/{id}/versions/{v}` | 版本完整布局（环带/开窗/预测/指标） |
 | GET | `/api/mask-schemes/{id}/versions/{v}/svg` | 1:1 遮罩 SVG（尺寸线 + 校准尺） |
 | POST | `/api/mask-schemes/search` | 在分区数 × 桥宽 × 权重模式范围内搜索可行布局并排序 |
+| POST | `/api/sessions` | 创建往返测量会话（引用遮罩版本 + 采集计划参数） |
+| GET | `/api/sessions` / `/api/sessions/{id}` | 会话列表 / 详情（计划、逐笔 attempt；`?correction=true` 带质量报告） |
+| POST | `/api/sessions/{id}/readings` | 按计划顺序逐笔提交刀口位置/方向/采集时间 |
+| POST | `/api/sessions/{id}/readings/retest` | 对指定测次补测（保留 attempt 历史，取最新有效） |
+| POST | `/api/sessions/{id}/readings/exclude` | 注明原因排除异常 attempt |
+| POST | `/api/sessions/{id}/lock` | 锁定可信读数（锁定后不可剔除/补测，并抑制其阈值违例） |
+| GET | `/api/sessions/{id}/quality` | 漂移/回程校正结果与阈值违例（不改变状态） |
+| POST | `/api/sessions/{id}/confirm` | 采集中 → 待确认（有阻断问题时 409） |
+| POST | `/api/sessions/{id}/finalize` | 定稿冻结并生成测试批次（重复定稿幂等返回同一批次） |
+| GET | `/api/sessions/{id}/freeze` | 定稿冻结包（原始记录、校正参数、输入哈希） |
+
+## 往返测量会话
+
+一次刀口仪上机测量对应一份往返测量会话，状态按
+**采集中 `collecting` → 待确认 `confirmed` → 已定稿 `finalized`** 流转。
+
+### 计划（不可变）
+
+创建会话时引用不可变遮罩版本（`mask_scheme_id` + `mask_version_no`，缺省取
+最新版本），并填写：
+
+- `repeats_per_zone`：每区每方向重复次数（每次重复含正向、反向各一遍扫掠，
+  每区定稿时合计 2n 个读数）
+- `start_direction`：起始方向（`forward` = 从内向外，`reverse` = 从外向内）
+- `reference_zone_index` / `reference_refresh`：参考区序号与复测频率
+  （每 N 个常规测位穿插一次参考区复测；计划开头另有一次锚点复测）
+- `collect_deadline`：采集时限；超出时限的采集时间被 422 拒绝
+- `wavelength_nm`、`instrument_offset`、`unit`（`mm` / `in`，长度量按会话
+  单位提交，内部换算 mm）与定稿批次分析选项 `options`
+
+测次（`seq`，从 1 开始）在计划中连续编号。逐笔提交必须严格落在下一个待采
+测次上：**漏测/跳步、同一计划位重复提交、分区或方向与计划不符、超出采集
+时限、定稿后追加数据**都会被拒绝（409/422），错误信息指明具体测次；
+漏测可在采完后通过补测接口补回，补测保留每次 attempt 历史并以最新未剔除
+attempt 为准。
+
+### 校正（Python）
+
+穿插复测的参考区观测用于拟合**零点线性漂移** `x = a + b·(t − t0)`
+（优先使用起始方向观测，避免回程间隙污染；不足 2 点时退回全部方向并标注），
+每条读数扣除漂移项；正反向均值差用于估计**回程间隙**（各区差值取中位数，
+对单区异常稳健），反向读数统一扣除。
+
+`GET .../quality` 响应给出：各区校正读数、均值/样本标准差/极差（离散度）、
+正向均值/反向均值/方向差、漂移斜率与各参考复测残差、全局回程间隙与逐区
+差值，以及漏测测次。阈值（默认取遮罩版本冻结的刀口尺分辨率，可在
+`thresholds` 中覆盖）：
+
+- `max_dispersion`：分区校正读数极差上限
+- `max_direction_diff`：正反向均值差上限
+- `max_drift_residual`：参考复测漂移残差上限
+
+存在阻断性违例（含漏测）时不能确认/定稿，违例信息列出具体测次；
+**锁定某区全部可信读数后，由这些读数构成的违例被抑制**（违例仍列出，
+标记 `locked_suppressed`）。
+
+### 定稿
+
+定稿冻结会话参数、遮罩版本指纹（含 `params_hash`）、计划、全部原始 attempt
+（含剔除原因、锁定标记）与校正参数（漂移截距/斜率、回程间隙），计算输入
+哈希（SHA-256），随后把各区漂移/回程校正读数作为分区读数自动生成
+`/api/tests` 测试批次并运行分析——现有分析、版本、对比与修正搜索接口可直接
+读取。定稿后原始记录不可追加、补测或剔除；**重复定稿幂等返回同一批次**
+（同一 `test_id`，`reused=true`）。
+
 
 ### 创建校验（不满足则 422 拒绝）
 

@@ -1,9 +1,12 @@
 """FastAPI 路由：测试批次管理、读数冻结/剔除、分析版本、批次对比、修正搜索、
-Couder 遮罩方案（版本化布局、边界搜索、1:1 SVG）。"""
+Couder 遮罩方案（版本化布局、边界搜索、1:1 SVG）、往返测量会话
+（逐笔采集、漂移/回程校正、定稿生成测试批次）。"""
 from __future__ import annotations
 
+import json
 import math
 import os
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException, Response
@@ -30,6 +33,7 @@ from .optics import (
 )
 from .schemas import (
     AnalyzeIn,
+    AnalysisOptionsIn,
     CompareIn,
     CorrectionSearchIn,
     ExcludeIn,
@@ -37,8 +41,19 @@ from .schemas import (
     MaskParamsIn,
     MaskSchemeCreateIn,
     MaskSearchIn,
+    ReadingSubmitIn,
     RestoreIn,
+    RetestIn,
+    SessionCreateIn,
+    SessionExcludeIn,
+    SessionLockIn,
     TestCreateIn,
+)
+from .session import (
+    SessionError,
+    build_plan,
+    correct_session,
+    iso as iso_dt,
 )
 from .storage import ConflictError, Database, NotFoundError
 
@@ -277,8 +292,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
         title="Foucault 刀口仪镜面分析 API",
         version=__version__,
         description="将 Couder 遮罩分区读数还原为镜面/波前误差，支持版本化分析、"
-        "读数冻结与剔除、批次对比、分区修正量搜索，以及 Couder 遮罩方案设计"
-        "（版本化布局、边界搜索、1:1 SVG 输出）。",
+        "读数冻结与剔除、批次对比、分区修正量搜索、Couder 遮罩方案设计"
+        "（版本化布局、边界搜索、1:1 SVG），以及上机往返测量会话"
+        "（逐笔校验、零点漂移/回程间隙校正、定稿冻结并生成测试批次）。",
     )
 
     @app.exception_handler(NotFoundError)
@@ -815,6 +831,513 @@ def create_app(db_path: str | None = None) -> FastAPI:
             subtitle=f"生成 {v['created_at']}",
         )
         return Response(content=svg, media_type="image/svg+xml")
+
+    # ---------------- 往返测量会话 ----------------
+
+    def _get_mask_version_for_session(scheme_id: int, version_no: int | None) -> dict:
+        if version_no is not None:
+            return db.get_mask_version(scheme_id, version_no)
+        return db.get_latest_mask_version(scheme_id)
+
+    def _current_readings_map(session: dict) -> dict:
+        """{seq: 当前有效读数行}；含漏测的 seq 映射为 None。"""
+        current: dict[int, dict | None] = {s["seq"]: None for s in session["plan"]}
+        # 取每个 seq 最大 attempt 的未剔除读数
+        best: dict[int, dict] = {}
+        for r in session["readings"]:
+            if r["excluded"]:
+                continue
+            old = best.get(r["seq"])
+            if old is None or r["attempt"] > old["attempt"]:
+                best[r["seq"]] = r
+        current.update(best)
+        return current
+
+    def _session_correction(session: dict) -> dict:
+        current = _current_readings_map(session)
+        inputs: dict[int, dict | None] = {}
+        for seq, r in current.items():
+            if r is None:
+                inputs[seq] = None
+            else:
+                slot = next(s for s in session["plan"] if s["seq"] == seq)
+                inputs[seq] = {
+                    "value_mm": r["knife_position"],
+                    "epoch": datetime.fromisoformat(r["collected_at"]).timestamp(),
+                    "direction": slot["direction"],
+                    "locked": bool(r["locked"]),
+                }
+        return correct_session(
+            session["plan"],
+            inputs,
+            session["thresholds"],
+            fit_direction=session["start_direction"],
+        )
+
+    def _slot_of(session: dict, seq: int) -> dict:
+        for s in session["plan"]:
+            if s["seq"] == seq:
+                return s
+        raise _err(422, f"测次 #{seq} 不在本会话计划内（计划共 "
+                        f"{len(session['plan'])} 个测次）")
+
+    def _require_writable(session: dict, seq: int | None = None) -> None:
+        if session["status"] == "finalized":
+            target = f"测次 #{seq} " if seq is not None else ""
+            raise _err(
+                409,
+                f"会话 {session['id']} 已定稿（批次 {session['test_id']}），"
+                f"{target}不能在定稿后追加或修改，原始记录已冻结",
+            )
+
+    def _validate_reading_payload(session: dict, slot: dict, payload, *, retest: bool) -> None:
+        """逐笔读数的业务校验（类型/字面量由 Pydantic 拦截）。"""
+        errs: list[str] = []
+        if payload.zone_index != slot["zone_index"]:
+            errs.append(
+                f"测次 #{slot['seq']} 计划分区为 {slot['zone_index']}，"
+                f"提交为 {payload.zone_index}（漏测或跳步请先补该测次）"
+            )
+        if payload.direction != slot["direction"]:
+            errs.append(
+                f"测次 #{slot['seq']} 计划移动方向为 {slot['direction']}，"
+                f"提交为 {payload.direction}"
+            )
+        collected = payload.collected_at
+        if collected.tzinfo is None:
+            collected = collected.replace(tzinfo=timezone.utc)
+        created_at = datetime.fromisoformat(session["created_at"])
+        if collected < created_at - timedelta(seconds=1):
+            errs.append(
+                f"测次 #{slot['seq']} 采集时间 {iso_dt(collected)} 早于建会话时间 "
+                f"{session['created_at']}"
+            )
+        if session.get("deadline"):
+            deadline = datetime.fromisoformat(session["deadline"])
+            if collected > deadline + timedelta(seconds=1):
+                errs.append(
+                    f"测次 #{slot['seq']} 采集时间 {iso_dt(collected)} 超出采集时限 "
+                    f"{session['deadline']}"
+                )
+        if not math.isfinite(payload.knife_position):
+            errs.append(f"测次 #{slot['seq']} 刀口位置必须是有限数值")
+        if errs:
+            raise _err(422, "读数校验失败", errs)
+        # 重复提交：非补测时同一计划位已有有效读数
+        if not retest:
+            existing = [
+                r for r in session["readings"]
+                if r["seq"] == slot["seq"] and not r["excluded"]
+            ]
+            if existing:
+                raise _err(
+                    409,
+                    f"测次 #{slot['seq']} 已有有效读数（attempt "
+                    f"{max(r['attempt'] for r in existing)}）：同一计划位重复提交被拒绝，"
+                    "如需覆盖请调用补测接口",
+                )
+
+    def _next_expected_seq(session: dict) -> int | None:
+        current = _current_readings_map(session)
+        for s in session["plan"]:
+            if current[s["seq"]] is None:
+                return s["seq"]
+        return None
+
+    def _session_brief(session: dict) -> dict:
+        return {
+            "id": session["id"],
+            "name": session["name"],
+            "status": session["status"],
+            "created_at": session["created_at"],
+            "deadline": session.get("deadline"),
+            "unit": session["unit"],
+            "repeats_per_zone": session["repeats_per_zone"],
+            "start_direction": session["start_direction"],
+            "reference_zone_index": session["reference_zone_index"],
+            "reference_refresh": session["reference_refresh"],
+            "mask_scheme_id": session["mask_scheme_id"],
+            "mask_version_no": session["mask_version_no"],
+            "test_id": session.get("test_id"),
+            "input_hash": session.get("input_hash"),
+        }
+
+    def _session_detail(session: dict, *, with_correction: bool = False) -> dict:
+        out = _session_brief(session)
+        out.update(
+            {
+                "notes": session["notes"],
+                "wavelength_nm": session["wavelength_nm"],
+                "instrument_offset": session["instrument_offset"],
+                "thresholds": session["thresholds"],
+                "options": session["options"],
+                "n_plan_slots": len(session["plan"]),
+                "plan": session["plan"],
+                "readings": [
+                    {
+                        "id": r["id"],
+                        "seq": r["seq"],
+                        "attempt": r["attempt"],
+                        "zone_index": r["zone_index"],
+                        "direction": r["direction"],
+                        "kind": r["kind"],
+                        "knife_position": r["knife_position"],
+                        "knife_position_original": r["knife_position_original"],
+                        "collected_at": r["collected_at"],
+                        "excluded": bool(r["excluded"]),
+                        "exclude_reason": r["exclude_reason"],
+                        "locked": bool(r["locked"]),
+                        "frozen": bool(r["frozen"]),
+                    }
+                    for r in session["readings"]
+                ],
+            }
+        )
+        if with_correction:
+            out["quality"] = _session_correction(session)
+        return out
+
+    @app.post("/api/sessions", status_code=201)
+    def create_session(payload: SessionCreateIn):
+        mv = _get_mask_version_for_session(
+            payload.mask_scheme_id, payload.mask_version_no
+        )
+        mp = mv["params"]
+        zone_count = len(mv["layout"]["zones"])
+        if payload.reference_zone_index >= zone_count:
+            raise _err(
+                422,
+                f"参考区序号 {payload.reference_zone_index} 超出遮罩分区数 {zone_count}",
+            )
+        factor = UNIT_TO_MM[payload.unit]
+        try:
+            plan = build_plan(
+                zone_count,
+                payload.repeats_per_zone,
+                payload.start_direction,
+                payload.reference_zone_index,
+                payload.reference_refresh,
+            )
+        except SessionError as exc:
+            raise _err(422, str(exc)) from exc
+        resolution_mm = mp["knife_resolution"]
+        thresholds_in = payload.thresholds
+        thresholds = {
+            mapped: (
+                getattr(thresholds_in, key) * factor
+                if getattr(thresholds_in, key) is not None
+                else resolution_mm
+            )
+            for key, mapped in (
+                ("max_dispersion", "max_dispersion_mm"),
+                ("max_direction_diff", "max_direction_diff_mm"),
+                ("max_drift_residual", "max_drift_residual_mm"),
+            )
+        }
+        if payload.options is not None:
+            options = payload.options.model_dump()
+        else:
+            options = AnalysisOptionsIn(
+                min_readings_per_zone=2 * payload.repeats_per_zone
+            ).model_dump()
+        deadline = None
+        if payload.collect_deadline is not None:
+            deadline = iso_dt(payload.collect_deadline)
+        record = {
+            "name": payload.name,
+            "notes": payload.notes,
+            "deadline": deadline,
+            "unit": payload.unit,
+            "repeats_per_zone": payload.repeats_per_zone,
+            "start_direction": payload.start_direction,
+            "reference_zone_index": payload.reference_zone_index,
+            "reference_refresh": payload.reference_refresh,
+            "mask_scheme_id": mv["scheme_id"],
+            "mask_version_no": mv["version_no"],
+            "wavelength_nm": payload.wavelength_nm,
+            "instrument_offset": payload.instrument_offset * factor,
+            "thresholds": thresholds,
+            "options": options,
+        }
+        session_id = db.create_session(record, plan)
+        session = db.get_session(session_id)
+        return {"session": _session_detail(session)}
+
+    @app.get("/api/sessions")
+    def list_sessions():
+        return {"sessions": db.list_sessions()}
+
+    @app.get("/api/sessions/{session_id}")
+    def get_session(session_id: int, correction: bool = False):
+        session = db.get_session(session_id)
+        return {"session": _session_detail(session, with_correction=correction)}
+
+    @app.get("/api/sessions/{session_id}/quality")
+    def session_quality(session_id: int):
+        session = db.get_session(session_id)
+        report = _session_correction(session)
+        report["session_id"] = session_id
+        report["thresholds"] = session["thresholds"]
+        report["status"] = session["status"]
+        return report
+
+    @app.post("/api/sessions/{session_id}/readings", status_code=201)
+    def submit_reading(session_id: int, payload: ReadingSubmitIn):
+        session = db.get_session(session_id)
+        _require_writable(session, payload.seq)
+        slot = _slot_of(session, payload.seq)
+        expected = _next_expected_seq(session)
+        if expected is not None and payload.seq != expected:
+            kind = "跳步" if payload.seq > expected else "重复提交"
+            raise _err(
+                409,
+                f"{kind}：下一个待采测次为 #{expected}，收到测次 #{payload.seq}；"
+                f"漏测测次请在采完后通过补测接口补回",
+            )
+        _validate_reading_payload(session, slot, payload, retest=False)
+        factor = UNIT_TO_MM[session["unit"]]
+        reading = db.add_session_reading(
+            session_id,
+            slot,
+            {
+                "knife_position_mm": payload.knife_position * factor,
+                "knife_position_original": payload.knife_position,
+                "collected_at": iso_dt(payload.collected_at),
+            },
+        )
+        if session["status"] == "confirmed":
+            db.set_session_status(session_id, "collecting")
+        return {
+            "reading_id": reading["id"],
+            "seq": slot["seq"],
+            "attempt": reading["attempt"],
+            "next_expected_seq": _next_expected_seq(db.get_session(session_id)),
+        }
+
+    @app.post("/api/sessions/{session_id}/readings/retest", status_code=201)
+    def retest_reading(session_id: int, payload: RetestIn):
+        session = db.get_session(session_id)
+        _require_writable(session, payload.seq)
+        slot = _slot_of(session, payload.seq)
+        # 锁定测位需先解锁才能补测（当前实现锁定即视为可信，不提供单独解锁）
+        locked = [
+            r for r in session["readings"]
+            if r["seq"] == payload.seq and r["locked"] and not r["excluded"]
+        ]
+        if locked:
+            raise _err(
+                409,
+                f"测次 #{payload.seq} 读数已锁定为可信，不能补测覆盖",
+            )
+        _validate_reading_payload(session, slot, payload, retest=True)
+        factor = UNIT_TO_MM[session["unit"]]
+        reading = db.add_session_reading(
+            session_id,
+            slot,
+            {
+                "knife_position_mm": payload.knife_position * factor,
+                "knife_position_original": payload.knife_position,
+                "collected_at": iso_dt(payload.collected_at),
+            },
+        )
+        if session["status"] == "confirmed":
+            db.set_session_status(session_id, "collecting")
+        return {
+            "reading_id": reading["id"],
+            "seq": slot["seq"],
+            "attempt": reading["attempt"],
+        }
+
+    @app.post("/api/sessions/{session_id}/readings/exclude")
+    def exclude_session_readings(session_id: int, payload: SessionExcludeIn):
+        session = db.get_session(session_id)
+        _require_writable(session)
+        targets = []
+        for item in payload.items:
+            r = db.get_session_reading(item.reading_id)
+            if r["session_id"] != session_id:
+                raise _err(
+                    409, f"读数 {item.reading_id} 不属于会话 {session_id}"
+                )
+            if r["frozen"]:
+                raise _err(409, f"读数 {item.reading_id} 已随定稿冻结，不能剔除")
+            if r["locked"]:
+                raise _err(409, f"测次 #{r['seq']} 读数已锁定为可信，不能剔除")
+            targets.append((item, r))
+        for item, r in targets:
+            db.set_session_reading_excluded(item.reading_id, True, item.reason)
+        if session["status"] == "confirmed":
+            db.set_session_status(session_id, "collecting")
+        session = db.get_session(session_id)
+        return {
+            "excluded": len(targets),
+            "quality": _session_correction(session),
+        }
+
+    @app.post("/api/sessions/{session_id}/lock")
+    def lock_session(session_id: int, payload: SessionLockIn):
+        session = db.get_session(session_id)
+        _require_writable(session)
+        if payload.all_collected:
+            count = db.lock_session_slots(session_id, None)
+        elif payload.seqs:
+            plan_seqs = {s["seq"] for s in session["plan"]}
+            bad = [n for n in payload.seqs if n not in plan_seqs]
+            if bad:
+                raise _err(422, f"测次 {bad} 不在本会话计划内")
+            current = _current_readings_map(session)
+            missing = [n for n in payload.seqs if current.get(n) is None]
+            if missing:
+                raise _err(409, f"测次 {missing} 尚无有效读数，不能锁定")
+            count = db.lock_session_slots(session_id, payload.seqs)
+        else:
+            raise _err(422, "请提供 seqs 或设置 all_collected=true")
+        return {"locked": count}
+
+    @app.post("/api/sessions/{session_id}/confirm")
+    def confirm_session(session_id: int):
+        session = db.get_session(session_id)
+        _require_writable(session)
+        report = _session_correction(session)
+        if not report["can_finalize"]:
+            raise _err(
+                409,
+                "存在阻断性测次问题，不能确认",
+                [v["message"] for v in report["blocking_violations"]],
+            )
+        db.set_session_status(session_id, "confirmed")
+        return {"session": _session_brief(db.get_session(session_id)), "quality": report}
+
+    def _build_freeze_bundle(session: dict, report: dict, mv: dict) -> dict:
+        """定稿冻结包：会话参数、遮罩版本指纹、计划、全部原始 attempt、校正参数。"""
+        return {
+            "session": {
+                "id": session["id"],
+                "name": session["name"],
+                "unit": session["unit"],
+                "repeats_per_zone": session["repeats_per_zone"],
+                "start_direction": session["start_direction"],
+                "reference_zone_index": session["reference_zone_index"],
+                "reference_refresh": session["reference_refresh"],
+                "wavelength_nm": session["wavelength_nm"],
+                "instrument_offset_mm": session["instrument_offset"],
+                "thresholds_mm": session["thresholds"],
+                "options": session["options"],
+            },
+            "mask": {
+                "scheme_id": mv["scheme_id"],
+                "version_no": mv["version_no"],
+                "params": mv["params"],
+                "params_hash": mv["params_hash"],
+            },
+            "plan": session["plan"],
+            "raw_readings": [
+                {
+                    "id": r["id"],
+                    "seq": r["seq"],
+                    "attempt": r["attempt"],
+                    "zone_index": r["zone_index"],
+                    "direction": r["direction"],
+                    "kind": r["kind"],
+                    "knife_position_mm": r["knife_position"],
+                    "knife_position_original": r["knife_position_original"],
+                    "collected_at": r["collected_at"],
+                    "excluded": bool(r["excluded"]),
+                    "exclude_reason": r["exclude_reason"],
+                    "locked": bool(r["locked"]),
+                }
+                for r in session["readings"]
+            ],
+            "correction": {
+                "drift": {
+                    "status": report["drift"]["status"],
+                    "t0_epoch": report["drift"]["t0_epoch"],
+                    "slope_mm_per_s": report["drift"]["slope_mm_per_s"],
+                    "intercept_mm": report["drift"]["intercept_mm"],
+                    "fit_observations": report["drift"]["fit_observations"],
+                },
+                "backlash_mm": report["backlash"]["global_mm"],
+            },
+        }
+
+    @app.post("/api/sessions/{session_id}/finalize")
+    def finalize_session(session_id: int):
+        session = db.get_session(session_id)
+        # 幂等：已定稿重复定稿返回同一批次
+        if session["status"] == "finalized":
+            return {
+                "session": _session_brief(session),
+                "test_id": session["test_id"],
+                "reused": True,
+            }
+        report = _session_correction(session)
+        if not report["can_finalize"]:
+            raise _err(
+                409,
+                "存在阻断性测次问题，不能定稿（请补测、排除异常或锁定可信读数）",
+                [v["message"] for v in report["blocking_violations"]],
+            )
+        mv = db.get_mask_version(session["mask_scheme_id"], session["mask_version_no"])
+        mp = mv["params"]
+        mzones = mv["layout"]["zones"]
+        # 每区校正读数（正反向均值已对齐）作为批次读数，顺序与遮罩环带一致
+        zone_readings_mm = []
+        for row, mz in zip(report["zones"], mzones):
+            vals = [e["corrected_mm"] for e in row["forward"] + row["reverse"]]
+            if not vals:
+                raise _err(409, f"分区 {row['zone_index']} 无有效读数，不能定稿")
+            zone_readings_mm.append(vals)
+        freeze = _build_freeze_bundle(session, report, mv)
+        input_hash = compute_input_hash(freeze)
+        record = {
+            "name": session["name"] or f"会话 {session_id} 定稿批次",
+            "notes": session["notes"],
+            "unit": "mm",  # 校正读数内部已是 mm
+            "source_mode": mp["source_mode"],
+            "diameter": mp["diameter"],
+            "radius_of_curvature": mp["radius_of_curvature"],
+            "conic_constant": mp["conic_constant"],
+            "wavelength_nm": session["wavelength_nm"],
+            "instrument_offset": session["instrument_offset"],
+            "options": session["options"],
+            "mask_scheme_id": mv["scheme_id"],
+            "mask_version_no": mv["version_no"],
+            "session_id": session_id,
+        }
+        zones = [
+            {
+                "inner_radius": mz["inner_radius"],
+                "outer_radius": mz["outer_radius"],
+                "readings": [(v, v) for v in vals],
+            }
+            for mz, vals in zip(mzones, zone_readings_mm)
+        ]
+        test_id = db.create_test(record, zones)
+        try:
+            version = _run_analysis(db, test_id)
+        except Exception:
+            # 分析失败不留孤儿批次（会话仍可在修正数据后重新定稿）
+            db.delete_test(test_id)
+            raise
+        freeze_str = json.dumps(freeze, sort_keys=True, ensure_ascii=True)
+        db.finalize_session(session_id, input_hash, freeze_str, test_id)
+        return {
+            "session": _session_brief(db.get_session(session_id)),
+            "test_id": test_id,
+            "version": _version_brief(version),
+            "input_hash": input_hash,
+            "reused": False,
+        }
+
+    @app.get("/api/sessions/{session_id}/freeze")
+    def get_session_freeze(session_id: int):
+        session = db.get_session(session_id)
+        if session["status"] != "finalized":
+            raise _err(409, f"会话 {session_id} 尚未定稿，无冻结包")
+        return {
+            "input_hash": session["input_hash"],
+            "freeze": json.loads(session["freeze_json"]) if session.get("freeze_json") else None,
+        }
 
     @app.get("/api/health")
     def health():

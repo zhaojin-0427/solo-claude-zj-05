@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -98,9 +99,6 @@ class CorrectionSearchIn(BaseModel):
     refit_defocus: bool = True
 
 
-# ---------------- Couder 遮罩 ----------------
-
-
 class MaskParamsIn(BaseModel):
     """遮罩版本冻结的全部参数（常量与制作限制）。
 
@@ -154,3 +152,70 @@ class MaskSearchIn(BaseModel):
         default_factory=lambda: ["equal_area", "equal_width"]
     )
     top: int = Field(default=10, ge=1, le=100)
+
+
+# ---------------- 往返测量会话 ----------------
+
+Direction = Literal["forward", "reverse"]
+
+
+class SessionThresholdsIn(BaseModel):
+    """定稿质量阈值（长度量按会话 unit 提交，内部换算为 mm）；
+    缺省 None 时由遮罩版本冻结的刀口尺分辨率补齐。"""
+
+    max_dispersion: float | None = Field(default=None, gt=0)
+    max_direction_diff: float | None = Field(default=None, gt=0)
+    max_drift_residual: float | None = Field(default=None, gt=0)
+
+
+class SessionCreateIn(BaseModel):
+    """创建往返测量会话：引用不可变遮罩版本并填写采集计划参数。"""
+
+    name: str | None = None
+    notes: str | None = None
+    mask_scheme_id: int
+    mask_version_no: int | None = None  # 缺省取该方案最新版本
+    unit: Unit = "mm"
+    repeats_per_zone: int = Field(ge=1, le=50)  # 每方向重复次数（每区合计 2n）
+    start_direction: Direction = "forward"
+    reference_zone_index: int = Field(default=0, ge=0)
+    reference_refresh: int = Field(default=2, ge=1)  # 每 N 个常规测位穿插一次参考复测
+    collect_deadline: datetime | None = None  # 采集时限；naive 按 UTC
+    wavelength_nm: float = Field(gt=0)
+    instrument_offset: float = 0.0
+    thresholds: SessionThresholdsIn = Field(default_factory=SessionThresholdsIn)
+    options: AnalysisOptionsIn | None = None  # 缺省 min_readings = 2·repeats
+
+
+class ReadingSubmitIn(BaseModel):
+    """逐笔提交刀口读数：必须严格落在计划中的下一个待采测次上。"""
+
+    seq: int = Field(ge=1)
+    knife_position: float  # 会话 unit 下的刀口测微器读数
+    zone_index: int = Field(ge=0)
+    direction: Direction
+    collected_at: datetime
+
+
+class RetestIn(BaseModel):
+    """对指定测次补测：旧 attempt 保留，新增一次 attempt。"""
+
+    seq: int = Field(ge=1)
+    knife_position: float
+    zone_index: int = Field(ge=0)
+    direction: Direction
+    collected_at: datetime
+
+
+class SessionExcludeItem(BaseModel):
+    reading_id: int
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class SessionExcludeIn(BaseModel):
+    items: list[SessionExcludeItem] = Field(min_length=1)
+
+
+class SessionLockIn(BaseModel):
+    seqs: list[int] | None = Field(default=None, min_length=1)
+    all_collected: bool = False  # True → 锁定全部已采集测位

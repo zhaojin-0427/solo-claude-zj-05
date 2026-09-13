@@ -5,6 +5,11 @@
 遮罩方案（mask_schemes + mask_scheme_versions）同样不可变：每个版本冻结
 常量、制作限制与计算出的环带/开窗布局；测试批次引用遮罩版本时复制其环带
 边界，此后遮罩另建版本不影响既有批次与分析。
+
+往返测量会话（measurement_sessions + session_readings）：会话冻结对遮罩
+版本的引用与采集计划（测次序列），逐笔读数（含补测 attempt、剔除原因、
+锁定/冻结标记）只增不改；定稿时写入冻结包哈希并关联自动生成的测试批次，
+此后原始记录全部冻结，重复定稿幂等返回同一批次。
 """
 from __future__ import annotations
 
@@ -72,12 +77,62 @@ CREATE TABLE IF NOT EXISTS mask_scheme_versions (
     params_hash TEXT NOT NULL,
     UNIQUE (scheme_id, version_no)
 );
+CREATE TABLE IF NOT EXISTS measurement_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'collecting',  -- collecting | confirmed | finalized
+    created_at TEXT NOT NULL,
+    deadline TEXT,                               -- 采集时限（UTC ISO）
+    unit TEXT NOT NULL,
+    repeats_per_zone INTEGER NOT NULL,
+    start_direction TEXT NOT NULL,
+    reference_zone_index INTEGER NOT NULL,
+    reference_refresh INTEGER NOT NULL,
+    mask_scheme_id INTEGER NOT NULL REFERENCES mask_schemes(id),
+    mask_version_no INTEGER NOT NULL,
+    wavelength_nm REAL NOT NULL,
+    instrument_offset REAL NOT NULL DEFAULT 0,  -- mm
+    thresholds_json TEXT NOT NULL,             -- 定稿质量阈值（mm）
+    options_json TEXT NOT NULL,                -- 定稿批次的分析选项
+    plan_json TEXT NOT NULL,                   -- 不可变测站计划（测次序列）
+    freeze_json TEXT,                          -- 定稿冻结包（原始记录 + 校正参数）
+    input_hash TEXT,                           -- 定稿冻结包哈希
+    finalized_at TEXT,
+    test_id INTEGER REFERENCES tests(id)
+);
+CREATE TABLE IF NOT EXISTS session_readings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES measurement_sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    attempt INTEGER NOT NULL,                  -- 同一测次补测逐次递增
+    zone_index INTEGER NOT NULL,
+    direction TEXT NOT NULL,
+    kind TEXT NOT NULL,                        -- reading | reference
+    knife_position REAL NOT NULL,              -- 规范值（mm）
+    knife_position_original REAL NOT NULL,     -- 声明单位原始值
+    collected_at TEXT NOT NULL,
+    excluded INTEGER NOT NULL DEFAULT 0,
+    exclude_reason TEXT,
+    locked INTEGER NOT NULL DEFAULT 0,
+    frozen INTEGER NOT NULL DEFAULT 0,         -- 定稿后冻结
+    created_at TEXT NOT NULL,
+    UNIQUE (session_id, seq, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_session_readings_session
+    ON session_readings(session_id);
 """
 
 # tests 表后加列（老库迁移）：批次引用的遮罩方案与版本
 _TEST_EXTRA_COLUMNS = {
     "mask_scheme_id": "ALTER TABLE tests ADD COLUMN mask_scheme_id INTEGER",
     "mask_version_no": "ALTER TABLE tests ADD COLUMN mask_version_no INTEGER",
+    "session_id": "ALTER TABLE tests ADD COLUMN session_id INTEGER",
+}
+
+# measurement_sessions 表后加列（老库迁移）
+_SESSION_EXTRA_COLUMNS = {
+    "freeze_json": "ALTER TABLE measurement_sessions ADD COLUMN freeze_json TEXT",
 }
 
 
@@ -114,6 +169,15 @@ class Database:
             for col, ddl in _TEST_EXTRA_COLUMNS.items():
                 if col not in cols:
                     self._conn.execute(ddl)
+            scols = {
+                r[1]
+                for r in self._conn.execute(
+                    "PRAGMA table_info(measurement_sessions)"
+                ).fetchall()
+            }
+            for col, ddl in _SESSION_EXTRA_COLUMNS.items():
+                if scols and col not in scols:
+                    self._conn.execute(ddl)
             self._conn.commit()
 
     def close(self) -> None:
@@ -133,8 +197,9 @@ class Database:
                 """INSERT INTO tests
                    (name, notes, created_at, unit, source_mode, diameter,
                     radius_of_curvature, conic_constant, wavelength_nm,
-                    instrument_offset, options_json, mask_scheme_id, mask_version_no)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    instrument_offset, options_json, mask_scheme_id,
+                    mask_version_no, session_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record.get("name"),
                     record.get("notes"),
@@ -149,6 +214,7 @@ class Database:
                     json.dumps(record["options"], ensure_ascii=True),
                     record.get("mask_scheme_id"),
                     record.get("mask_version_no"),
+                    record.get("session_id"),
                 ),
             )
             test_id = cur.lastrowid
@@ -202,6 +268,12 @@ class Database:
             return [dict(r) for r in rows]
 
     # ---------------- 读数状态 ----------------
+
+    def delete_test(self, test_id: int) -> None:
+        """删除批次及其分区/读数/版本（定稿失败回调用；外键级联）。"""
+        with self._lock:
+            self._conn.execute("DELETE FROM tests WHERE id = ?", (test_id,))
+            self._conn.commit()
 
     def get_reading(self, reading_id: int) -> dict:
         with self._lock:
@@ -409,3 +481,189 @@ class Database:
         d["params"] = json.loads(d.pop("params_json"))
         d["layout"] = json.loads(d.pop("layout_json"))
         return d
+
+    # ---------------- 往返测量会话 ----------------
+
+    def create_session(self, record: dict, plan: list[dict]) -> int:
+        """创建采集会话；record 含会话参数（mm 规范值）、阈值、分析选项。"""
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO measurement_sessions
+                   (name, notes, status, created_at, deadline, unit,
+                    repeats_per_zone, start_direction, reference_zone_index,
+                    reference_refresh, mask_scheme_id, mask_version_no,
+                    wavelength_nm, instrument_offset, thresholds_json,
+                    options_json, plan_json)
+                   VALUES (?, ?, 'collecting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.get("name"),
+                    record.get("notes"),
+                    _now(),
+                    record.get("deadline"),
+                    record["unit"],
+                    record["repeats_per_zone"],
+                    record["start_direction"],
+                    record["reference_zone_index"],
+                    record["reference_refresh"],
+                    record["mask_scheme_id"],
+                    record["mask_version_no"],
+                    record["wavelength_nm"],
+                    record["instrument_offset"],
+                    json.dumps(record["thresholds"], ensure_ascii=True),
+                    json.dumps(record["options"], ensure_ascii=True),
+                    json.dumps(plan, ensure_ascii=True),
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def _session_dict(self, row: sqlite3.Row) -> dict:
+        d = dict(row)
+        d["thresholds"] = json.loads(d.pop("thresholds_json"))
+        d["options"] = json.loads(d.pop("options_json"))
+        d["plan"] = json.loads(d.pop("plan_json"))
+        return d
+
+    def get_session(self, session_id: int) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM measurement_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"测量会话 {session_id} 不存在")
+            s = self._session_dict(row)
+            rows = self._conn.execute(
+                "SELECT * FROM session_readings WHERE session_id = ? ORDER BY seq, attempt",
+                (session_id,),
+            ).fetchall()
+            s["readings"] = [dict(r) for r in rows]
+            return s
+
+    def list_sessions(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, name, status, created_at, deadline, unit,"
+                " repeats_per_zone, start_direction, reference_zone_index,"
+                " reference_refresh, mask_scheme_id, mask_version_no,"
+                " finalized_at, test_id FROM measurement_sessions ORDER BY id"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_slot_readings(self, session_id: int, seq: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM session_readings WHERE session_id = ? AND seq = ?"
+                " ORDER BY attempt",
+                (session_id, seq),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def add_session_reading(self, session_id: int, slot: dict, reading: dict) -> dict:
+        """按计划测位追加一次读数（attempt 自动递增）。
+
+        slot 为计划测位；reading 含 knife_position（mm）、原始值、collected_at。
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(attempt), 0) AS a FROM session_readings"
+                " WHERE session_id = ? AND seq = ?",
+                (session_id, slot["seq"]),
+            ).fetchone()
+            attempt = int(row["a"]) + 1
+            self._conn.execute(
+                """INSERT INTO session_readings
+                   (session_id, seq, attempt, zone_index, direction, kind,
+                    knife_position, knife_position_original, collected_at,
+                    created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    slot["seq"],
+                    attempt,
+                    slot["zone_index"],
+                    slot["direction"],
+                    slot["kind"],
+                    reading["knife_position_mm"],
+                    reading["knife_position_original"],
+                    reading["collected_at"],
+                    _now(),
+                ),
+            )
+            self._conn.commit()
+            return self._current_session_reading(session_id, slot["seq"])
+
+    def _current_session_reading(self, session_id: int, seq: int) -> dict:
+        """某测位当前有效读数：最大 attempt 且未剔除；无则返回 None。"""
+        row = self._conn.execute(
+            "SELECT * FROM session_readings WHERE session_id = ? AND seq = ?"
+            " AND excluded = 0 ORDER BY attempt DESC LIMIT 1",
+            (session_id, seq),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_session_reading(self, reading_id: int) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM session_readings WHERE id = ?", (reading_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"会话读数 {reading_id} 不存在")
+            return dict(row)
+
+    def set_session_reading_excluded(
+        self, reading_id: int, excluded: bool, reason: str | None
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE session_readings SET excluded = ?, exclude_reason = ?"
+                " WHERE id = ?",
+                (1 if excluded else 0, reason if excluded else None, reading_id),
+            )
+            self._conn.commit()
+
+    def lock_session_slots(self, session_id: int, seqs: list[int] | None) -> int:
+        """锁定测位的当前有效读数；seqs=None 时锁定全部已采集测位。"""
+        with self._lock:
+            if seqs is None:
+                cur = self._conn.execute(
+                    "UPDATE session_readings SET locked = 1 WHERE session_id = ?"
+                    " AND excluded = 0",
+                    (session_id,),
+                )
+            else:
+                cur = self._conn.executemany(
+                    "UPDATE session_readings SET locked = 1"
+                    " WHERE session_id = ? AND seq = ? AND excluded = 0",
+                    [(session_id, seq) for seq in seqs],
+                )
+            self._conn.commit()
+            return cur.rowcount
+
+    def set_session_status(self, session_id: int, status: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE measurement_sessions SET status = ? WHERE id = ?",
+                (status, session_id),
+            )
+            self._conn.commit()
+
+    def finalize_session(
+        self,
+        session_id: int,
+        input_hash: str,
+        freeze_json: str,
+        test_id: int,
+    ) -> None:
+        """定稿：冻结哈希、关联测试批次、冻结全部原始读数（attempt 历史保留）。"""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE measurement_sessions SET status = 'finalized',"
+                " input_hash = ?, freeze_json = ?, finalized_at = ?, test_id = ?"
+                " WHERE id = ?",
+                (input_hash, freeze_json, _now(), test_id, session_id),
+            )
+            self._conn.execute(
+                "UPDATE session_readings SET frozen = 1 WHERE session_id = ?",
+                (session_id,),
+            )
+            self._conn.commit()
