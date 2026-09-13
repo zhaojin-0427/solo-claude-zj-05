@@ -197,11 +197,20 @@ def reduce_test(constants: Constants, zones: list[ZoneInput], options: Options) 
     delta_k = 8.0 * R**3 * a4_mm  # 无量纲
 
     # 7) 波前误差与汇总指标
+    #    RMS 按圆形口径面积加权：面元 dA = 2πr dr，均匀网格 dr 恒定 → 权重 ∝ r。
+    #    均匀半径统计会低估边缘大误差，使 RMS 系统性偏低、Strehl 偏高。
     w_nm = 2.0 * e_nm
+    w_area = g  # 权重正比于半径（dr 均匀，2π 为常数可约去）
+    w_sum = float(w_area.sum())
+
+    def _area_weighted_std(x: np.ndarray) -> float:
+        m = float((w_area * x).sum() / w_sum)
+        return float(math.sqrt(float((w_area * (x - m) ** 2).sum()) / w_sum))
+
     surf_pv = float(e_nm.max() - e_nm.min())
-    surf_rms = float(e_nm.std())
+    surf_rms = _area_weighted_std(e_nm)
     wf_pv_nm = float(w_nm.max() - w_nm.min())
-    wf_rms_nm = float(w_nm.std())
+    wf_rms_nm = _area_weighted_std(w_nm)
     strehl = float(math.exp(-((2.0 * math.pi * wf_rms_nm / lam) ** 2)))
 
     # 8) 分区处指标：残余波前、横向像差、误差带标记

@@ -229,6 +229,7 @@ def test_version_immutable_and_deterministic(client):
     # 剔除一个读数生成 v2
     detail = client.get(f"/api/tests/{tid}").json()
     rid = detail["test"]["zones"][4]["readings"][0]["id"]
+    orig_val = detail["test"]["zones"][4]["readings"][0]["value_original"]
     client.post(
         f"/api/tests/{tid}/readings/exclude",
         json={"items": [{"reading_id": rid, "reason": "离群"}]},
@@ -237,9 +238,18 @@ def test_version_immutable_and_deterministic(client):
     assert v1a == v1b  # 历史版本不受后续操作影响
     v2 = client.get(f"/api/tests/{tid}/versions/2").json()
     assert v2["input_hash"] != v1a["input_hash"]
-    # 快照冻结了当时的有效读数
-    assert len(v2["snapshot"]["zones"][4]["readings"]) == 2
-    assert len(v1a["snapshot"]["zones"][4]["readings"]) == 3
+    # 快照冻结全部原始读数（含被剔除者）及其状态与原因，可完整还原输入
+    z4 = v2["snapshot"]["zones"][4]
+    assert len(z4["readings"]) == 3  # 被剔除的读数仍在快照中
+    exc = [r for r in z4["readings"] if r["excluded"]]
+    assert len(exc) == 1
+    assert exc[0]["id"] == rid
+    assert exc[0]["exclude_reason"] == "离群"
+    assert exc[0]["value_original"] == orig_val
+    valid = [r for r in z4["readings"] if not r["excluded"]]
+    assert len(valid) == 2
+    # v1 快照中该区 3 条全部有效
+    assert all(not r["excluded"] for r in v1a["snapshot"]["zones"][4]["readings"])
 
 
 def test_analyze_idempotent_when_unchanged(client):

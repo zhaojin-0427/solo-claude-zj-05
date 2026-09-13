@@ -77,7 +77,30 @@ def test_surface_profile_recovery():
     coef, *_ = np.linalg.lstsq(A, e_true(g), rcond=None)
     e_exp = e_true(g) - A @ coef
     assert np.max(np.abs(e_rec - e_exp)) < 1.5  # nm
-    assert res["summary"]["surface_rms_nm"] == pytest.approx(e_exp.std(), rel=0.05)
+    # 报告 RMS 为面积加权值
+    w = g / g.sum()
+    exp_rms = float(np.sqrt(np.sum(w * (e_exp - np.sum(w * e_exp)) ** 2)))
+    assert res["summary"]["surface_rms_nm"] == pytest.approx(exp_rms, rel=0.05)
+
+
+def test_area_weighted_rms():
+    """RMS 按圆形口径面积加权：边缘集中的误差，加权 RMS 高于均匀半径统计。"""
+    # 误差集中在边缘（x→1），面积权重应放大其贡献
+    e_true = lambda r: 100.0 * (r / 100.0) ** 10
+    zones = synth_zones(e_true)
+    res = reduce_test(make_constants(), zones, Options())
+    g = np.array(res["profile"]["r_mm"])
+    e_rec = np.array(res["profile"]["residual_surface_nm"])
+    uniform_rms = float(e_rec.std())
+    w = g / g.sum()
+    weighted_rms = float(np.sqrt(np.sum(w * (e_rec - np.sum(w * e_rec)) ** 2)))
+    assert weighted_rms > uniform_rms  # 边缘误差大，面积加权 > 均匀统计
+    assert res["summary"]["surface_rms_nm"] == pytest.approx(weighted_rms, rel=1e-9)
+    assert res["summary"]["wavefront_rms_nm"] == pytest.approx(2.0 * weighted_rms, rel=1e-9)
+    # Strehl 与面积加权 RMS 自洽（Maréchal）
+    lam = LAM
+    expect_strehl = float(np.exp(-((2.0 * np.pi * res["summary"]["wavefront_rms_nm"] / lam) ** 2)))
+    assert res["summary"]["strehl"] == pytest.approx(expect_strehl, rel=1e-12)
 
 
 def test_moving_source_factor():

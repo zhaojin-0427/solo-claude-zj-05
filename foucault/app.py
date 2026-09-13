@@ -120,7 +120,11 @@ def _collect_valid_zones(test: dict) -> list[ZoneInput]:
 
 
 def _build_snapshot(test: dict, options_dict: dict) -> dict:
-    """版本快照：常量 + 算法选项 + 有效读数（冻结原始输入）。"""
+    """版本快照：常量 + 算法选项 + 全部原始读数（含剔除状态与原因）。
+
+    快照必须能完整还原创建该版本时的输入面貌：每条读数的原始提交值、
+    规范值（mm）、是否被剔除及剔除原因都原样冻结。
+    """
     zones = []
     for z in sorted(test["zones"], key=lambda x: x["zone_index"]):
         readings = [
@@ -128,9 +132,11 @@ def _build_snapshot(test: dict, options_dict: dict) -> dict:
                 "id": r["id"],
                 "value": r["value"],
                 "value_original": r["value_original"],
+                "excluded": bool(r["excluded"]),
+                "exclude_reason": r["exclude_reason"],
+                "frozen": bool(r["frozen"]),
             }
             for r in z["readings"]
-            if not r["excluded"]
         ]
         zones.append(
             {
@@ -156,6 +162,11 @@ def _build_snapshot(test: dict, options_dict: dict) -> dict:
 
 
 def _hash_payload(snapshot: dict) -> dict:
+    """输入哈希只覆盖真正参与分析的数据：常量、选项、有效读数值。
+
+    剔除原因、冻结标记等元数据不改变分析输入，不进哈希；
+    剔除/恢复改变有效读数集合，会改变哈希从而产生新版本。
+    """
     return {
         "constants": snapshot["constants"],
         "options": snapshot["options"],
@@ -163,7 +174,9 @@ def _hash_payload(snapshot: dict) -> dict:
             {
                 "inner_radius": z["inner_radius"],
                 "outer_radius": z["outer_radius"],
-                "readings": [r["value"] for r in z["readings"]],
+                "readings": [
+                    r["value"] for r in z["readings"] if not r["excluded"]
+                ],
             }
             for z in snapshot["zones"]
         ],

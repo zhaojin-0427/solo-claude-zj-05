@@ -98,9 +98,14 @@ def _evaluate(
     areas: np.ndarray,
     wavelength_nm: float,
 ) -> dict:
-    """候选方案指标：剩余波前、修正平滑度、材料去除量。"""
+    """候选方案指标：剩余波前、修正平滑度、材料去除量。
+
+    剩余波前 RMS 按分区面积加权（圆形口径面积元 ∝ 半径），与分析报告口径一致。
+    """
     resid = M @ (e - c)
-    rms_nm = float(np.sqrt(np.mean(resid**2)))
+    w = areas / areas.sum()
+    m = float(np.sum(w * resid))
+    rms_nm = float(np.sqrt(np.sum(w * (resid - m) ** 2)))
     pv_nm = float(resid.max() - resid.min())
     sd = D @ c
     smooth = float(np.sqrt(np.mean(sd**2))) if sd.size else 0.0

@@ -69,14 +69,18 @@ class ConflictError(Exception):
 
 
 class Database:
-    """单连接 + 锁的轻量封装（本机服务，并发量低）。"""
+    """单连接 + 可重入锁的轻量封装（本机服务，并发量低）。
+
+    使用 RLock：create_version 等方法在持锁期间会调用其他加锁方法
+    （如 get_version），不可重入锁会导致请求线程自我死锁。
+    """
 
     def __init__(self, path: str = "foucault.db"):
         self.path = path
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._conn.commit()
