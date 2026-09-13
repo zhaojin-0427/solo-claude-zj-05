@@ -37,7 +37,7 @@ python3 run.py                 # 或 uvicorn foucault.app:app
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/tests` | 创建测试批次并自动生成分析版本 v1 |
+| POST | `/api/tests` | 创建测试批次并自动生成分析版本 v1（可直接给分区，或引用遮罩版本） |
 | GET | `/api/tests` / `/api/tests/{id}` | 批次列表 / 详情（含读数状态） |
 | POST | `/api/tests/{id}/readings/exclude` | 带原因剔除读数（可自动重分析） |
 | POST | `/api/tests/{id}/readings/restore` | 恢复被剔除读数 |
@@ -46,6 +46,12 @@ python3 run.py                 # 或 uvicorn foucault.app:app
 | GET | `/api/tests/{id}/versions[/n]` | 版本列表 / 版本完整结果 |
 | POST | `/api/compare` | 对比多个测试批次（遮罩一致时给出逐区差值） |
 | POST | `/api/tests/{id}/corrections/search` | 约束下搜索分区修正量并排序 |
+| POST | `/api/mask-schemes` | 创建遮罩方案并生成版本 v1（常量与制作限制冻结） |
+| GET | `/api/mask-schemes` / `/api/mask-schemes/{id}` | 方案列表 / 详情（含版本列表） |
+| POST | `/api/mask-schemes/{id}/versions` | 新参数生成新版本（参数相同则幂等复用） |
+| GET | `/api/mask-schemes/{id}/versions/{v}` | 版本完整布局（环带/开窗/预测/指标） |
+| GET | `/api/mask-schemes/{id}/versions/{v}/svg` | 1:1 遮罩 SVG（尺寸线 + 校准尺） |
+| POST | `/api/mask-schemes/search` | 在分区数 × 桥宽 × 权重模式范围内搜索可行布局并排序 |
 
 ### 创建校验（不满足则 422 拒绝）
 
@@ -73,6 +79,35 @@ python3 run.py                 # 或 uvicorn foucault.app:app
 `preserve_edge`（边缘保留）、`max_mean_removal_nm`（面积加权平均深度上限）
 约束下，对一组平滑权重解盒约束二次规划，候选方案按
 **(剩余波前 RMS, 修正平滑度, 材料去除量)** 升序排列。
+
+### Couder 遮罩设计
+
+遮罩方案把**口径、曲率半径、目标圆锥常数、光源模式与制作限制**（计划分区数、
+中心禁测半径、最小环宽、桥宽、刀口尺分辨率、打印缩放校准）冻结为独立版本，
+每个版本保存计算出的环带边界、等效半径、左右开窗与指标，创建后不可变；
+参数相同重复建版本时幂等复用。
+
+- 分区权重：`equal_area`（等面积）、`equal_width`（等环宽）、`custom`
+  （自定义权重，各环带面积 ∝ 权重）
+- 开窗几何：每环带左右两个矩形窗，竖直方向以等效半径 r_m 为中心，窗高在
+  "相邻开窗间距 ≥ 桥宽" 且 "窗高 ≤ 环宽 − 桥宽" 约束下取最大（投影法求解）；
+  水平方向由环带边界弦长决定（内环带窗底边高于 r_in 时左右窗在中心线相连）
+- **拒绝生成**（422，逐条指明相关环带）：分区越界（禁测半径 ≥ 镜面半径等）、
+  环宽不足（< 最小环宽）、结构无法留桥（环宽 ≤ 桥宽、等效半径间距 < 桥宽、
+  留桥约束下窗高为零）、开窗相交（开窗越出本环带边界侵入相邻环带）
+- 刀口位移预测：各区理想刀口位移 `LA_ideal(r_m)`（移动光源减半），以最内
+  环带为零点；相邻区对读数差低于刀口尺分辨率的区对被标出
+  （`layout.prediction.unresolvable_pairs`）
+- 边界搜索：`/api/mask-schemes/search` 在分区数 × 桥宽 × 权重模式范围内
+  枚举，仅保留可行布局，按 **(最小可分辨位移, 面积均衡度, 制作余量)** 降序；
+  候选 `params` 可直接用于创建遮罩版本
+- SVG：`.../versions/{v}/svg` 输出 1:1 图纸（mm 单位，含直径/半径/窗高
+  尺寸线、校准尺与参数说明），打印缩放校准 `print_scale` 已计入全部几何，
+  100% 打印后用校准尺实测核对
+- 批次冻结：`POST /api/tests` 传 `mask_scheme_id`（可指定 `mask_version_no`，
+  缺省最新）+ `zone_readings`（按遮罩环带顺序）即可建批；常量与环带边界
+  取自遮罩版本冻结值（重复提供且不一致则 422），批次记录遮罩版本 ID，
+  此后遮罩另建版本不影响既有批次与分析
 
 ## 测试
 

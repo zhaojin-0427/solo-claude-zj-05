@@ -1,7 +1,10 @@
-"""SQLite 持久化：测试批次、分区、读数、分析版本。
+"""SQLite 持久化：测试批次、分区、读数、分析版本、遮罩方案版本。
 
 分析版本（versions）冻结创建时刻的有效读数快照、常量、算法选项与输入哈希，
 结果 JSON 一旦写入不再修改，保证重复读取结果不变。
+遮罩方案（mask_schemes + mask_scheme_versions）同样不可变：每个版本冻结
+常量、制作限制与计算出的环带/开窗布局；测试批次引用遮罩版本时复制其环带
+边界，此后遮罩另建版本不影响既有批次与分析。
 """
 from __future__ import annotations
 
@@ -53,7 +56,29 @@ CREATE TABLE IF NOT EXISTS versions (
     result_json TEXT NOT NULL,
     UNIQUE (test_id, version_no)
 );
+CREATE TABLE IF NOT EXISTS mask_schemes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    notes TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mask_scheme_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scheme_id INTEGER NOT NULL REFERENCES mask_schemes(id) ON DELETE CASCADE,
+    version_no INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    params_json TEXT NOT NULL,   -- 冻结的常量与制作限制（mm）
+    layout_json TEXT NOT NULL,   -- 环带边界 / 开窗 / 刀口位移预测 / 指标
+    params_hash TEXT NOT NULL,
+    UNIQUE (scheme_id, version_no)
+);
 """
+
+# tests 表后加列（老库迁移）：批次引用的遮罩方案与版本
+_TEST_EXTRA_COLUMNS = {
+    "mask_scheme_id": "ALTER TABLE tests ADD COLUMN mask_scheme_id INTEGER",
+    "mask_version_no": "ALTER TABLE tests ADD COLUMN mask_version_no INTEGER",
+}
 
 
 def _now() -> str:
@@ -83,6 +108,12 @@ class Database:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            cols = {
+                r[1] for r in self._conn.execute("PRAGMA table_info(tests)").fetchall()
+            }
+            for col, ddl in _TEST_EXTRA_COLUMNS.items():
+                if col not in cols:
+                    self._conn.execute(ddl)
             self._conn.commit()
 
     def close(self) -> None:
@@ -92,14 +123,18 @@ class Database:
     # ---------------- 创建 ----------------
 
     def create_test(self, record: dict, zones: list[dict]) -> int:
-        """record 为常量（mm）+ options_json；zones 含 readings（mm 与原始值）。"""
+        """record 为常量（mm）+ options_json；zones 含 readings（mm 与原始值）。
+
+        record 可带 mask_scheme_id / mask_version_no：批次冻结所引用遮罩
+        版本的 ID，环带边界已在 zones 中复制，此后遮罩变更不影响本批次。
+        """
         with self._lock:
             cur = self._conn.execute(
                 """INSERT INTO tests
                    (name, notes, created_at, unit, source_mode, diameter,
                     radius_of_curvature, conic_constant, wavelength_nm,
-                    instrument_offset, options_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    instrument_offset, options_json, mask_scheme_id, mask_version_no)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record.get("name"),
                     record.get("notes"),
@@ -112,6 +147,8 @@ class Database:
                     record["wavelength_nm"],
                     record["instrument_offset"],
                     json.dumps(record["options"], ensure_ascii=True),
+                    record.get("mask_scheme_id"),
+                    record.get("mask_version_no"),
                 ),
             )
             test_id = cur.lastrowid
@@ -265,4 +302,110 @@ class Database:
         d = dict(row)
         d["snapshot"] = json.loads(d.pop("snapshot_json"))
         d["result"] = json.loads(d.pop("result_json"))
+        return d
+
+    # ---------------- 遮罩方案 ----------------
+
+    def create_mask_scheme(self, name: str | None, notes: str | None = None) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO mask_schemes (name, notes, created_at) VALUES (?, ?, ?)",
+                (name, notes, _now()),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def get_mask_scheme(self, scheme_id: int) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM mask_schemes WHERE id = ?", (scheme_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"遮罩方案 {scheme_id} 不存在")
+            scheme = dict(row)
+            scheme["versions"] = self.list_mask_versions(scheme_id)
+            return scheme
+
+    def list_mask_schemes(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT s.id, s.name, s.notes, s.created_at, "
+                " COUNT(v.id) AS n_versions, MAX(v.version_no) AS latest_version_no"
+                " FROM mask_schemes s"
+                " LEFT JOIN mask_scheme_versions v ON v.scheme_id = s.id"
+                " GROUP BY s.id ORDER BY s.id"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def create_mask_version(
+        self, scheme_id: int, params: dict, layout: dict, params_hash: str
+    ) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(version_no), 0) AS v"
+                " FROM mask_scheme_versions WHERE scheme_id = ?",
+                (scheme_id,),
+            ).fetchone()
+            version_no = int(row["v"]) + 1
+            self._conn.execute(
+                "INSERT INTO mask_scheme_versions"
+                " (scheme_id, version_no, created_at, params_json, layout_json,"
+                "  params_hash) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    scheme_id,
+                    version_no,
+                    _now(),
+                    json.dumps(params, ensure_ascii=True),
+                    json.dumps(layout, ensure_ascii=True),
+                    params_hash,
+                ),
+            )
+            self._conn.commit()
+            return self.get_mask_version(scheme_id, version_no)
+
+    def get_mask_version(self, scheme_id: int, version_no: int) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM mask_scheme_versions"
+                " WHERE scheme_id = ? AND version_no = ?",
+                (scheme_id, version_no),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"遮罩方案 {scheme_id} 的版本 {version_no} 不存在"
+                )
+            return self._mask_version_dict(row)
+
+    def get_latest_mask_version(self, scheme_id: int) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM mask_scheme_versions WHERE scheme_id = ?"
+                " ORDER BY version_no DESC LIMIT 1",
+                (scheme_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"遮罩方案 {scheme_id} 尚无版本")
+            return self._mask_version_dict(row)
+
+    def list_mask_versions(self, scheme_id: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, scheme_id, version_no, created_at, params_hash,"
+                " layout_json FROM mask_scheme_versions"
+                " WHERE scheme_id = ? ORDER BY version_no",
+                (scheme_id,),
+            ).fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                layout = json.loads(d.pop("layout_json"))
+                d["metrics"] = layout.get("metrics", {})
+                out.append(d)
+            return out
+
+    @staticmethod
+    def _mask_version_dict(row: sqlite3.Row) -> dict:
+        d = dict(row)
+        d["params"] = json.loads(d.pop("params_json"))
+        d["layout"] = json.loads(d.pop("layout_json"))
         return d

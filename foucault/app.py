@@ -1,14 +1,24 @@
-"""FastAPI 路由：测试批次管理、读数冻结/剔除、分析版本、批次对比、修正搜索。"""
+"""FastAPI 路由：测试批次管理、读数冻结/剔除、分析版本、批次对比、修正搜索、
+Couder 遮罩方案（版本化布局、边界搜索、1:1 SVG）。"""
 from __future__ import annotations
 
 import math
 import os
+from types import SimpleNamespace
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import JSONResponse
 
 from . import __version__
 from .correction import CorrectionError, search_corrections
+from .mask import (
+    MaskError,
+    MaskParams,
+    compute_layout,
+    render_mask_svg,
+    search_layouts,
+    validate_constants as validate_mask_constants,
+)
 from .optics import (
     UNIT_TO_MM,
     AnalysisError,
@@ -24,6 +34,9 @@ from .schemas import (
     CorrectionSearchIn,
     ExcludeIn,
     FreezeIn,
+    MaskParamsIn,
+    MaskSchemeCreateIn,
+    MaskSearchIn,
     RestoreIn,
     TestCreateIn,
 )
@@ -39,32 +52,39 @@ def _err(status: int, message: str, details: list | None = None) -> HTTPExceptio
     )
 
 
-def _validate_payload(p: TestCreateIn) -> list[str]:
-    """业务校验：返回错误列表（空 = 通过）。类型/字面量错误由 Pydantic 拦截。"""
+def _validate_constants(
+    diameter: float,
+    radius_of_curvature: float,
+    conic_constant: float,
+    wavelength_nm: float,
+    instrument_offset: float,
+) -> list[str]:
     errs: list[str] = []
     for name, val in (
-        ("diameter", p.diameter),
-        ("radius_of_curvature", p.radius_of_curvature),
-        ("conic_constant", p.conic_constant),
-        ("wavelength_nm", p.wavelength_nm),
-        ("instrument_offset", p.instrument_offset),
+        ("diameter", diameter),
+        ("radius_of_curvature", radius_of_curvature),
+        ("conic_constant", conic_constant),
+        ("wavelength_nm", wavelength_nm),
+        ("instrument_offset", instrument_offset),
     ):
         if not math.isfinite(val):
             errs.append(f"{name} 必须是有限数值")
-    if p.diameter <= 0:
+    if diameter <= 0:
         errs.append("镜面口径必须为正数")
-    if p.radius_of_curvature <= 0:
+    if radius_of_curvature <= 0:
         errs.append("曲率半径必须为正数")
-    if p.wavelength_nm <= 0:
+    if wavelength_nm <= 0:
         errs.append("检测波长必须为正数")
-    if abs(p.conic_constant) > 10:
+    if abs(conic_constant) > 10:
         errs.append("目标圆锥常数超出合理范围 |K| <= 10")
-    if errs:
-        return errs
+    return errs
 
-    rim = p.diameter / 2.0
-    min_n = p.options.min_readings_per_zone
-    zones = sorted(p.zones, key=lambda z: (z.inner_radius, z.outer_radius))
+
+def _validate_zones(diameter: float, zones: list, min_n: int) -> list[str]:
+    """分区业务校验；zones 与 diameter 同单位（读数只查有限性与数量）。"""
+    errs: list[str] = []
+    rim = diameter / 2.0
+    zones = sorted(zones, key=lambda z: (z.inner_radius, z.outer_radius))
     for i, z in enumerate(zones):
         label = f"分区 {i}（{z.inner_radius}~{z.outer_radius}）"
         if not (math.isfinite(z.inner_radius) and math.isfinite(z.outer_radius)):
@@ -86,6 +106,20 @@ def _validate_payload(p: TestCreateIn) -> list[str]:
                 f"{label}：有效读数不足（{len(z.readings)} < {min_n}）"
             )
     return errs
+
+
+def _validate_payload(p: TestCreateIn) -> list[str]:
+    """业务校验：返回错误列表（空 = 通过）。类型/字面量错误由 Pydantic 拦截。"""
+    errs = _validate_constants(
+        p.diameter,
+        p.radius_of_curvature,
+        p.conic_constant,
+        p.wavelength_nm,
+        p.instrument_offset,
+    )
+    if errs:
+        return errs
+    return _validate_zones(p.diameter, p.zones, p.options.min_readings_per_zone)
 
 
 def _constants_of(test: dict) -> Constants:
@@ -220,7 +254,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
         title="Foucault 刀口仪镜面分析 API",
         version=__version__,
         description="将 Couder 遮罩分区读数还原为镜面/波前误差，支持版本化分析、"
-        "读数冻结与剔除、批次对比和分区修正量搜索。",
+        "读数冻结与剔除、批次对比、分区修正量搜索，以及 Couder 遮罩方案设计"
+        "（版本化布局、边界搜索、1:1 SVG 输出）。",
     )
 
     @app.exception_handler(NotFoundError)
@@ -239,10 +274,134 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def _correction_error(_, exc: CorrectionError):
         return JSONResponse(status_code=422, content={"detail": {"message": str(exc)}})
 
+    @app.exception_handler(MaskError)
+    async def _mask_error(_, exc: MaskError):
+        return JSONResponse(
+            status_code=422,
+            content={"detail": {"message": "遮罩设计校验失败", "errors": exc.errors}},
+        )
+
     # ---------------- 测试批次 ----------------
+
+    def _create_test_from_mask(payload: TestCreateIn) -> dict:
+        """引用遮罩版本创建批次：常量与环带边界取自遮罩版本冻结值。"""
+        if payload.mask_version_no is not None:
+            mv = db.get_mask_version(payload.mask_scheme_id, payload.mask_version_no)
+        else:
+            mv = db.get_latest_mask_version(payload.mask_scheme_id)
+        mp = mv["params"]  # 冻结常量（mm）
+        unit = payload.unit or "mm"
+        factor = UNIT_TO_MM[unit]
+        mismatches = []
+        for name, provided, frozen_mm in (
+            ("diameter", payload.diameter, mp["diameter"]),
+            (
+                "radius_of_curvature",
+                payload.radius_of_curvature,
+                mp["radius_of_curvature"],
+            ),
+        ):
+            if provided is not None and abs(provided * factor - frozen_mm) > 1e-6:
+                mismatches.append(
+                    f"{name}={provided} 与遮罩版本冻结值 {frozen_mm} mm 不一致"
+                )
+        if (
+            payload.conic_constant is not None
+            and abs(payload.conic_constant - mp["conic_constant"]) > 1e-9
+        ):
+            mismatches.append(
+                f"conic_constant={payload.conic_constant} 与遮罩版本冻结值 "
+                f"{mp['conic_constant']} 不一致"
+            )
+        if payload.source_mode is not None and payload.source_mode != mp["source_mode"]:
+            mismatches.append(
+                f"source_mode={payload.source_mode} 与遮罩版本冻结值 "
+                f"{mp['source_mode']} 不一致"
+            )
+        if mismatches:
+            raise _err(422, "与遮罩版本冻结常量不一致", mismatches)
+        if payload.zone_readings is None:
+            raise _err(422, "引用遮罩版本时需提供 zone_readings（按遮罩环带顺序）")
+        mzones = mv["layout"]["zones"]
+        if len(payload.zone_readings) != len(mzones):
+            raise _err(
+                422,
+                f"zone_readings 数量 {len(payload.zone_readings)} 与遮罩环带数 "
+                f"{len(mzones)} 不一致",
+            )
+        errs = _validate_constants(
+            mp["diameter"],
+            mp["radius_of_curvature"],
+            mp["conic_constant"],
+            payload.wavelength_nm,
+            payload.instrument_offset,
+        )
+        zone_objs = [
+            SimpleNamespace(
+                inner_radius=z["inner_radius"],
+                outer_radius=z["outer_radius"],
+                readings=rd,
+            )
+            for z, rd in zip(mzones, payload.zone_readings)
+        ]
+        errs += _validate_zones(
+            mp["diameter"], zone_objs, payload.options.min_readings_per_zone
+        )
+        if errs:
+            raise _err(422, "测试数据校验失败", errs)
+        zones = [
+            {
+                "inner_radius": z["inner_radius"],
+                "outer_radius": z["outer_radius"],
+                "readings": [(r * factor, r) for r in rd],
+            }
+            for z, rd in zip(mzones, payload.zone_readings)
+        ]
+        record = {
+            "name": payload.name,
+            "notes": payload.notes,
+            "unit": unit,
+            "source_mode": mp["source_mode"],
+            "diameter": mp["diameter"],
+            "radius_of_curvature": mp["radius_of_curvature"],
+            "conic_constant": mp["conic_constant"],
+            "wavelength_nm": payload.wavelength_nm,
+            "instrument_offset": payload.instrument_offset * factor,
+            "options": payload.options.model_dump(),
+            "mask_scheme_id": mv["scheme_id"],
+            "mask_version_no": mv["version_no"],
+        }
+        test_id = db.create_test(record, zones)
+        version = _run_analysis(db, test_id)
+        return {
+            "test": db.get_test(test_id),
+            "version": _version_brief(version),
+            "mask": {"scheme_id": mv["scheme_id"], "version_no": mv["version_no"]},
+        }
 
     @app.post("/api/tests", status_code=201)
     def create_test(payload: TestCreateIn):
+        if payload.mask_scheme_id is not None:
+            return _create_test_from_mask(payload)
+        missing = [
+            name
+            for name, val in (
+                ("diameter", payload.diameter),
+                ("radius_of_curvature", payload.radius_of_curvature),
+                ("conic_constant", payload.conic_constant),
+                ("source_mode", payload.source_mode),
+                ("unit", payload.unit),
+            )
+            if val is None
+        ]
+        if payload.zones is None:
+            missing.append("zones")
+        if missing:
+            raise _err(
+                422,
+                f"缺少必填字段：{', '.join(missing)}"
+                "（或提供 mask_scheme_id 引用遮罩版本）",
+            )
         errs = _validate_payload(payload)
         if errs:
             raise _err(422, "测试数据校验失败", errs)
@@ -476,6 +635,145 @@ def create_app(db_path: str | None = None) -> FastAPI:
             raise _err(422, str(exc)) from exc
         result["based_on"] = {"test_id": test_id, "version_no": v["version_no"]}
         return result
+
+    # ---------------- Couder 遮罩方案 ----------------
+
+    def _mask_params_of(p: MaskParamsIn) -> MaskParams:
+        f = UNIT_TO_MM[p.unit]
+        return MaskParams(
+            diameter=p.diameter * f,
+            radius_of_curvature=p.radius_of_curvature * f,
+            conic_constant=p.conic_constant,
+            source_mode=p.source_mode,
+            zone_count=p.zone_count,
+            weighting=p.weighting,
+            weights=p.weights,
+            center_exclusion_radius=p.center_exclusion_radius * f,
+            min_zone_width=p.min_zone_width * f,
+            bridge_width=p.bridge_width * f,
+            knife_resolution=p.knife_resolution * f,
+            print_scale=p.print_scale,
+        )
+
+    def _create_mask_version_idem(scheme_id: int, params: MaskParams) -> dict:
+        """计算布局并写入遮罩版本；参数与最新版本一致时复用（幂等）。"""
+        layout = compute_layout(params)  # MaskError → 422
+        norm = params.normalized()
+        params_hash = compute_input_hash(norm)
+        try:
+            latest = db.get_latest_mask_version(scheme_id)
+        except NotFoundError:
+            latest = None
+        if latest is not None and latest["params_hash"] == params_hash:
+            latest["reused"] = True
+            return latest
+        version = db.create_mask_version(scheme_id, norm, layout, params_hash)
+        version["reused"] = False
+        return version
+
+    def _mask_version_brief(v: dict) -> dict:
+        return {
+            "scheme_id": v["scheme_id"],
+            "version_no": v["version_no"],
+            "created_at": v["created_at"],
+            "params_hash": v["params_hash"],
+            "metrics": v["layout"].get("metrics", {}),
+            "reused": v.get("reused", False),
+        }
+
+    @app.post("/api/mask-schemes", status_code=201)
+    def create_mask_scheme(payload: MaskSchemeCreateIn):
+        params = _mask_params_of(payload)
+        scheme_id = db.create_mask_scheme(payload.name, payload.notes)
+        version = _create_mask_version_idem(scheme_id, params)
+        return {
+            "scheme": db.get_mask_scheme(scheme_id),
+            "version": _mask_version_brief(version),
+        }
+
+    @app.get("/api/mask-schemes")
+    def list_mask_schemes():
+        return {"schemes": db.list_mask_schemes()}
+
+    @app.post("/api/mask-schemes/search")
+    def search_mask(payload: MaskSearchIn):
+        if payload.zone_count_max < payload.zone_count_min:
+            raise _err(422, "zone_count_max 不能小于 zone_count_min")
+        if payload.bridge_width_max < payload.bridge_width_min:
+            raise _err(422, "bridge_width_max 不能小于 bridge_width_min")
+        counts = list(range(payload.zone_count_min, payload.zone_count_max + 1))
+        bw_min, bw_max = payload.bridge_width_min, payload.bridge_width_max
+        if payload.bridge_width_step is not None:
+            bridges = []
+            v = bw_min
+            while v <= bw_max + 1e-9 and len(bridges) < 501:
+                bridges.append(round(v, 9))
+                v += payload.bridge_width_step
+        elif abs(bw_max - bw_min) < 1e-12:
+            bridges = [bw_min]
+        else:
+            bridges = [bw_min + (bw_max - bw_min) * i / 4.0 for i in range(5)]
+        combos = len(counts) * len(bridges) * len(payload.layouts)
+        if combos > 2000:
+            raise _err(422, f"搜索组合过多（{combos} > 2000），请缩小范围")
+        f = UNIT_TO_MM[payload.unit]
+        base = MaskParams(
+            diameter=payload.diameter * f,
+            radius_of_curvature=payload.radius_of_curvature * f,
+            conic_constant=payload.conic_constant,
+            source_mode=payload.source_mode,
+            zone_count=payload.zone_count_min,
+            weighting="equal_area",
+            weights=None,
+            center_exclusion_radius=payload.center_exclusion_radius * f,
+            min_zone_width=payload.min_zone_width * f,
+            bridge_width=bw_min * f,
+            knife_resolution=payload.knife_resolution * f,
+            print_scale=1.0,
+        )
+        const_errs = validate_mask_constants(base)
+        if const_errs:
+            raise _err(422, "遮罩常量校验失败", const_errs)
+        bridges_mm = [b * f for b in bridges]
+        result = search_layouts(
+            base, counts, bridges_mm, list(payload.layouts), top=payload.top
+        )
+        return result
+
+    @app.get("/api/mask-schemes/{scheme_id}")
+    def get_mask_scheme(scheme_id: int):
+        return {"scheme": db.get_mask_scheme(scheme_id)}
+
+    @app.post("/api/mask-schemes/{scheme_id}/versions", status_code=201)
+    def create_mask_version(scheme_id: int, payload: MaskParamsIn):
+        db.get_mask_scheme(scheme_id)
+        version = _create_mask_version_idem(scheme_id, _mask_params_of(payload))
+        return {"version": _mask_version_brief(version)}
+
+    @app.get("/api/mask-schemes/{scheme_id}/versions/{version_no}")
+    def get_mask_version(scheme_id: int, version_no: int):
+        v = db.get_mask_version(scheme_id, version_no)
+        return {
+            "scheme_id": v["scheme_id"],
+            "version_no": v["version_no"],
+            "created_at": v["created_at"],
+            "params_hash": v["params_hash"],
+            "params": v["params"],
+            "layout": v["layout"],
+        }
+
+    @app.get("/api/mask-schemes/{scheme_id}/versions/{version_no}/svg")
+    def mask_svg(scheme_id: int, version_no: int):
+        scheme = db.get_mask_scheme(scheme_id)
+        v = db.get_mask_version(scheme_id, version_no)
+        name = scheme.get("name") or "遮罩方案"
+        svg = render_mask_svg(
+            v["params"],
+            v["layout"],
+            title=f"Couder 遮罩 {name} #{scheme_id} v{version_no}",
+            subtitle=f"生成 {v['created_at']}",
+        )
+        return Response(content=svg, media_type="image/svg+xml")
 
     @app.get("/api/health")
     def health():

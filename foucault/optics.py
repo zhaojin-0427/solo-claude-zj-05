@@ -69,6 +69,14 @@ class Options:
     reference: str = "innermost"  # 零点参考："innermost" | "mean"
 
 
+def ideal_la(r, conic_constant: float, radius_of_curvature: float):
+    """目标圆锥的理想纵向像差 LA_ideal(r) = -K · r² / R（固定光源等效，mm）。
+
+    接受标量或 numpy 数组；遮罩设计与读数还原共用同一公式。
+    """
+    return -conic_constant * r**2 / radius_of_curvature
+
+
 def compute_input_hash(payload: dict) -> str:
     """对规范化后的输入（常量 + 有效读数 + 算法选项）计算稳定哈希。"""
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -162,7 +170,7 @@ def reduce_test(constants: Constants, zones: list[ZoneInput], options: Options) 
     la = np.array([st["la"] for st in stats])
 
     # 4) 相对目标圆锥的纵向像差误差
-    la_ideal = -K * r_m**2 / R
+    la_ideal = ideal_la(r_m, K, R)
     la_err = la - la_ideal
 
     # 5) 积分出面形轮廓 h(r)：alpha = -LA_err * r / (2 R^2)
