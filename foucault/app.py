@@ -1915,18 +1915,24 @@ def create_app(db_path: str | None = None) -> FastAPI:
             if payload.version_no is not None
             else db.get_latest_study_version(study_id)
         )
-        # 严格按所选版本冻结：参与求解的来源取该版本 active_source_ids，
-        # 排除状态取该版本写入时的排除快照，不读取研究当前来源状态。
+        # 严格按所选版本冻结：该版本的来源全集 = 参与求解的 active_source_ids
+        # ∪ 该版本写入时的排除快照。后来版本追加的来源（更高 source_index、
+        # 既不在 active 也不在排除快照）一律不进入冻结包，绝不读取研究当前
+        # 来源全集，也不会把新来源标成 excluded 混入。
         active_ids = set(v["active_source_ids"])
-        by_id = {s["id"]: s for s in study["sources"]}
-        excluded_by_index = {
-            e["source_index"]: e for e in v["excluded_snapshot"]
+        excluded_indices = {
+            e["source_index"]: e["reason"] for e in v["excluded_snapshot"]
         }
+        universe = [
+            s
+            for s in sorted(study["sources"], key=lambda x: x["source_index"])
+            if s["id"] in active_ids or s["source_index"] in excluded_indices
+        ]
         sources = []
-        for s in sorted(study["sources"], key=lambda x: x["source_index"]):
+        for s in universe:
             sv = db.get_version(s["test_id"], s["version_no"])
             was_active = s["id"] in active_ids
-            snap = excluded_by_index.get(s["source_index"])
+            reason = excluded_indices.get(s["source_index"])
             sources.append(
                 {
                     "source_index": s["source_index"],
@@ -1938,7 +1944,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "sampled_at": s["sampled_at"],
                     "active_in_frozen_version": was_active,
                     "excluded": not was_active,
-                    "exclude_reason": snap["reason"] if snap else None,
+                    "exclude_reason": None if was_active else reason,
                 }
             )
         n_active = sum(1 for x in sources if x["active_in_frozen_version"])

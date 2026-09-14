@@ -75,10 +75,11 @@ def test_separates_mirror_and_lab_components():
     for z in res["zones"]:
         assert abs(z["mirror"]["axis_deg"] - 30.0) < 3.0
         assert abs(z["lab_fixed"]["axis_deg"] - 110.0) < 3.0
-    # 外缘镜面幅值随 radial 剖面 = 1.2 × 0.012
+    # 外缘镜面幅值随 radial 剖面 = (0.8+0.4·80/90) × 幅值
+    prof_outer = 0.8 + 0.4 * RADII[-1] / 90.0
     outer = res["zones"][-1]
-    assert outer["mirror"]["amplitude_mm"] == pytest.approx(0.012 * 1.2, abs=5e-4)
-    assert outer["lab_fixed"]["amplitude_mm"] == pytest.approx(0.005 * 1.2, abs=5e-4)
+    assert outer["mirror"]["amplitude_mm"] == pytest.approx(0.012 * prof_outer, abs=5e-4)
+    assert outer["lab_fixed"]["amplitude_mm"] == pytest.approx(0.005 * prof_outer, abs=5e-4)
     # 整体波前主轴
     am = res["astigmatism"]["mirror"]
     al = res["astigmatism"]["lab_fixed"]
@@ -135,15 +136,32 @@ def test_exactly_just_identified_has_null_ci():
     assert res["zones"][0]["mirror"]["amplitude_ci_mm"] is None
 
 
-def test_n4_generic_angles_underdetermined():
-    # 5 参数（截距+4 谐波）只有 4 个观测：一般角度下镜面/架位谐波方向共线，
-    # 不含截距也无法分离两对象散 → 欠秩缺口（需要第 5 份来源或独立角度）。
+def test_n4_confounded_angles_underdetermined():
+    # ψ、α 同步共线变化（α≡ψ+常数）：四列谐波矩阵 rank<4，两对象散混淆 → 缺口
     psi4 = [0.0, 30.0, 60.0, 90.0]
-    alpha4 = [0.0, 90.0, 30.0, 135.0]
+    alpha4 = [10.0, 40.0, 70.0, 100.0]
     y = make_signals(psi=psi4, alpha=alpha4, noise=0.0)
     with pytest.raises(MeridianError) as ei:
         fit_harmonics(psi4, alpha4, y, RADII, INNER, OUTER, R, RIM, LAM)
-    assert ei.value.gaps  # 至少指出一个无法识别的分量
+    assert ei.value.gaps
+    assert any("混淆" in g for g in ei.value.gaps)
+
+
+def test_n4_user_config_full_rank_accepted():
+    # 用户案例 ψ=[0,30,60,90]、α=[0,90,30,135]：四列谐波矩阵满秩，4 份即可建档
+    psi4 = [0.0, 30.0, 60.0, 90.0]
+    alpha4 = [0.0, 90.0, 30.0, 135.0]
+    y = make_signals(psi=psi4, alpha=alpha4, noise=0.0)
+    res = fit_harmonics(psi4, alpha4, y, RADII, INNER, OUTER, R, RIM, LAM)
+    assert res["rank"] == 4
+    assert "intercept" not in res["fitted_columns"]
+    z = res["zones"][-1]
+    assert abs(z["mirror"]["axis_deg"] - 30.0) < 1e-6
+    assert abs(z["lab_fixed"]["axis_deg"] - 110.0) < 1e-6
+    # 外缘 r=80 的径向系数 0.8+0.4·80/90 = 1.15556
+    prof = 0.8 + 0.4 * RADII[-1] / 90.0
+    assert z["mirror"]["amplitude_mm"] == pytest.approx(0.012 * prof, abs=1e-9)
+    assert z["lab_fixed"]["amplitude_mm"] == pytest.approx(0.005 * prof, abs=1e-9)
 
 
 def test_n4_separable_harmonics_solves_without_intercept():

@@ -193,6 +193,49 @@ def test_finalize_selected_version_freezes_its_source_set(client):
     assert all(not s["excluded"] for s in fz["sources"])
 
 
+def test_four_sources_user_angle_config_accepted(client):
+    # ψ=[0,30,60,90]、α=[0,90,30,135]：四列谐波矩阵满秩，4 份即可建档
+    psi4 = [0.0, 30.0, 60.0, 90.0]
+    alpha4 = [0.0, 90.0, 30.0, 135.0]
+    ids = _make_batches(client, n=4)
+    r = client.post(
+        "/api/meridian-studies",
+        json={"sources": _sources(ids, psi=psi4, alpha=alpha4), "loo": False},
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["version"]["summary"]["rank"] == 4
+
+
+def test_finalize_old_version_excludes_later_appended_source(client):
+    # v1（8 份）→ 追加第 9 份生成 v2 → 定稿 v1：冻结包只能含 v1 的 8 份来源，
+    # 第 9 份既不出现也不能被标为 excluded。
+    r, _ = _create_study(client, loo=False)
+    sid = r.json()["study"]["id"]
+    extra_id = _make_batches(client, n=9)[-1]
+    client.post(
+        f"/api/meridian-studies/{sid}/sources",
+        json={"sources": [{
+            "test_id": extra_id, "mirror_rotation_deg": 75.0,
+            "knife_diameter_azimuth_deg": 60.0,
+            "sampled_at": "2026-02-01T10:00:00+00:00",
+        }]},
+    )
+    fin = client.post(
+        f"/api/meridian-studies/{sid}/finalize", json={"version_no": 1}
+    )
+    assert fin.status_code == 200, fin.text
+    fz = client.get(f"/api/meridian-studies/{sid}/freeze").json()["freeze"]
+    assert fz["frozen_version_no"] == 1
+    assert fz["n_active_sources"] == 8
+    assert len(fz["sources"]) == 8
+    indices = {s["source_index"] for s in fz["sources"]}
+    assert indices == set(range(8))  # 不含第 9 份（source_index 8）
+    assert 8 not in indices
+    # v1 的历史留一报告也仍是 8 份，不读当前 9 份来源
+    loo1 = client.get(f"/api/meridian-studies/{sid}/loo?version_no=1").json()
+    assert len(loo1["loo"]["leave_one_out"]) == 8
+
+
 def test_reject_fewer_than_four_sources(client):
     ids = _make_batches(client, n=4)
     payload = {"sources": _sources(ids)[:3]}

@@ -21,14 +21,14 @@
 为周期，内部按 cos2/sin2 归算。
 
 可识别性：
-- 刀口方位 α 固定、只旋转镜面时，架位项在各来源间为常数（被截距吸收），
-  只能识别镜面分量；反之镜面不旋转时只能识别架位分量。要分离两者，ψ 与 α
-  都须有非共线的角度散布。矩阵欠秩时不强行给出伪结果，而是逐分量指出缺口
-  与补测建议（MeridianError.gaps）。
-可识别性在谐波 4 列上按正交投影判定（N=4 与 N≥5 通用）：某分量投影掉
-截距与另一分量后仍满秩即可识别。4 份来源且 ψ、α 的二次谐波方向独立时，
-4 个谐波系数满秩、直接拟合（不估轴对称截距 c，c 并入残差）；≥5 份且 c
-独立可估时再拟合截距。真正不可识别（角度共线/两分量混淆）时才报缺口。
+- 刀口方位 α 固定、只旋转镜面时，架位列秩不足，只能识别镜面分量；反之镜面
+  不旋转时只能识别架位分量；ψ 与 α 同步共线变化（α≡±ψ+常数）时两对象散
+  混淆。欠秩时不强行给出伪结果，而是逐分量指出缺口与补测建议
+  （MeridianError.gaps）。
+可辨识性只看完整四列谐波矩阵（镜面 cos/sin、架位 cos/sin）是否满秩。
+4 份来源且四列满秩（rank 4）时四个谐波系数唯一可解，直接拟合（不估轴对称
+截距 c，c 并入残差），如 ψ=[0,30,60,90]、α=[0,90,30,135]；≥5 份且 c 相对
+谐波独立可估（5 列满秩）时再拟合截距。
 
 LA → 波前：各半径的复 LA 谐波 A_j = c_j + i·s_j（保留相位）按环带面积
 积分 h = (1/2R²)∫₀^rim ρ·A(ρ) dρ，波前 W = 2h（反射加倍）。整体主轴由
@@ -143,74 +143,42 @@ def design_matrix(mirror_rot_deg, knife_az_deg) -> np.ndarray:
     )
 
 
-def _harmonic_identifiability(A_h: np.ndarray):
-    """在谐波 4 列矩阵上判定两对象散是否可识别（截距正交投影，N=4/≥5 通用）。
+def _harmonic_gaps(psi: np.ndarray, alpha: np.ndarray) -> list[str]:
+    """按完整四列谐波矩阵是否满秩判定可辨识性，并翻译角度缺口。
 
-    返回 (mirror_ok, lab_ok)。各自的两列（cos,sin）投影掉对方与截距后必须仍
-    满秩（rank 2），且镜面列与架位列不共线（否则两对象散混淆）。
+    模型（不含轴对称截距）的四列为镜面 cos2ψ/sin2ψ 与架位 cos2α/sin2α：
+    四列满秩（rank 4）时四个谐波系数唯一可解，N=4 即可建档求解。仅当真正
+    欠秩（某角度无变化、只取 0/90 共线方位，或 ψ 与 α 同步使两类像散混淆）
+    时才返回缺口说明。
     """
-    n = A_h.shape[0]
-    ones = np.ones((n, 1))
-    M = A_h[:, 0:2]
-    L = A_h[:, 2:4]
+    M2 = np.column_stack([
+        np.cos(2 * np.radians(psi)), np.sin(2 * np.radians(psi))
+    ])
+    L2 = np.column_stack([
+        np.cos(2 * np.radians(alpha)), np.sin(2 * np.radians(alpha))
+    ])
+    mirror_diverse = _norm_rank(M2) >= 2
+    lab_diverse = _norm_rank(L2) >= 2
+    joint = np.column_stack([M2, L2])
+    confounded = _norm_rank(joint) < 4  # 两对象散方向空间重叠（通常 α≡±ψ+const）
 
-    def _proj_off(cols, basis):
-        if basis.shape[1] == 0:
-            return cols
-        Q, *_ = np.linalg.qr(basis, mode="reduced")
-        return cols - Q @ (Q.T @ cols)
-
-    # 镜面：投影掉截距 + 架位
-    Pm = _proj_off(M, np.column_stack([ones, L]))
-    mirror_ok = _norm_rank(Pm) >= 2
-    # 架位：投影掉截距 + 镜面
-    Pl = _proj_off(L, np.column_stack([ones, M]))
-    lab_ok = _norm_rank(Pl) >= 2
-    return mirror_ok, lab_ok
-
-
-def _angle_gaps(psi: np.ndarray, alpha: np.ndarray, mirror_ok: bool,
-                lab_ok: bool) -> list[str]:
-    """把真正不可识别的分量翻译成面向操作者的角度缺口说明。"""
     gaps: list[str] = []
-
-    def _noncollinear(angles: np.ndarray) -> bool:
-        doubled = 2.0 * np.radians(angles)
-        v = np.column_stack([np.cos(doubled), np.sin(doubled)])
-        return _norm_rank(v) >= 2
-
-    def _collinear_between():
-        # 镜面 2 列与架位 2 列张成同一方向（α 的二次谐波落在 ψ 谐波空间），
-        # 两类像散在不含截距时也互相混淆
-        M2 = np.column_stack([
-            np.cos(2 * np.radians(psi)), np.sin(2 * np.radians(psi))
-        ])
-        L2 = np.column_stack([
-            np.cos(2 * np.radians(alpha)), np.sin(2 * np.radians(alpha))
-        ])
-        return _norm_rank(np.column_stack([M2, L2])) < 4
-
-    both_diverse = _noncollinear(psi) and _noncollinear(alpha)
-    if not mirror_ok:
-        tip = "补充镜面旋转角不同的来源"
-        if not _noncollinear(psi):
-            tip = ("镜面旋转角只在 0°/90° 等共线方位取值，需补充旋转角相差"
-                   "非 0°/90° 的来源")
-        elif both_diverse and _collinear_between():
-            tip = ("镜面旋转与刀口扫描直径方位同步变化（两者二次谐波方向共线），"
-                   "随镜面转动的面形分量与架位系统分量互相混淆，需让 ψ 与 α "
-                   "独立变化，或补充第 5 份来源以同时估计轴对称截距")
-        gaps.append("镜面随转分量无法识别：" + tip)
-    if not lab_ok:
-        tip = "补充刀口扫描直径方位不同的来源"
-        if not _noncollinear(alpha):
-            tip = ("刀口扫描直径方位只在 0°/90° 等共线方位取值，需补充方位相差"
-                   "非 0°/90° 的来源")
-        elif both_diverse and _collinear_between():
-            tip = ("刀口扫描直径方位与镜面旋转角同步变化（两者二次谐波方向共线），"
-                   "架位固定的系统分量与随镜面转动分量互相混淆，需让 ψ 与 α "
-                   "独立变化，或补充第 5 份来源以同时估计轴对称截距")
-        gaps.append("架位固定分量无法识别：" + tip)
+    if not mirror_diverse:
+        gaps.append(
+            "镜面随转分量无法识别：镜面旋转角只在 0°/90° 等共线方位取值或无"
+            "变化，需补充旋转角相差非 0°/90° 的来源"
+        )
+    if not lab_diverse:
+        gaps.append(
+            "架位固定分量无法识别：刀口扫描直径方位只在 0°/90° 等共线方位取值"
+            "或无变化，需补充方位相差非 0°/90° 的来源"
+        )
+    if mirror_diverse and lab_diverse and confounded:
+        gaps.append(
+            "镜面随转分量与架位固定分量互相混淆：镜面旋转角与刀口扫描直径"
+            "方位同步共线变化（α≡±ψ+常数），需让 ψ 与 α 独立变化，或补充"
+            "更多来源使四个谐波方向满秩"
+        )
     return gaps
 
 
@@ -316,25 +284,22 @@ def fit_harmonics(
             ["补充更多不同镜面旋转角 / 刀口方位的复测来源（研究档案 4~16 份）"],
         )
 
-    # 谐波 4 列的可识别性在正交投影下判定（N=4 或 N≥5 通用）：每个分量投影
-    # 掉截距与另一分量后仍须满秩。这样 4 份来源且 4 个谐波系数满秩时直接求解
-    # （不拟合截距）；只有真正不可识别的角度组合才报缺口。
+    # 可辨识性只看完整四列谐波矩阵是否满秩：rank 4 时四个谐波系数唯一可解
+    # （N=4 即直接拟合谐波、不估轴对称截距）。只有真正欠秩的角度组合才报缺口。
     A_full = design_matrix(psi, alpha)
     rank_full = _norm_rank(A_full)
     A_harm = A_full[:, 1:5]
-    mirror_ok, lab_ok = _harmonic_identifiability(A_harm)
-    gaps = _angle_gaps(psi, alpha, mirror_ok, lab_ok)
-    if gaps:
+    if _norm_rank(A_harm) < 4:
         raise MeridianError(
             "角度组合使二次谐波拟合矩阵欠秩，镜面随转分量与架位固定分量无法分离",
-            gaps,
+            _harmonic_gaps(psi, alpha),
         )
 
-    # 4 个谐波系数在 4 列上满秩：N=4 时只能拟合谐波（截距并入残差，轴对称
-    # 残余不进入像散）；N≥5 且截距独立可估时再拟合截距。
+    # N≥5 且截距相对四个谐波独立可估时再拟合截距（5 列满秩）；否则只拟合
+    # 4 个谐波（N=4，或截距恰好落在谐波空间），轴对称残余并入残差。
     use_cols = list(_COL_MIRROR) + list(_COL_LAB)
     A4 = A_full[:, use_cols]
-    if n >= 5 and _norm_rank(np.column_stack([np.ones(n), A4])) > _norm_rank(A4):
+    if n >= 5 and _norm_rank(np.column_stack([np.ones(n), A4])) > 4:
         use_cols = [_COL_INTERCEPT] + use_cols
     use_cols.sort()
     A = A_full[:, use_cols]
