@@ -30,6 +30,7 @@ from .meridian import (
     extract_zone_signals,
     fit_harmonics,
     leave_one_out,
+    loo_from_fit_result,
 )
 from .optics import (
     UNIT_TO_MM,
@@ -1850,36 +1851,27 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/api/meridian-studies/{study_id}/loo")
     def study_loo(study_id: int, version_no: int | None = None):
-        study = db.get_study(study_id)
+        db.get_study(study_id)
         v = (
             db.get_study_version(study_id, version_no)
             if version_no is not None
             else db.get_latest_study_version(study_id)
         )
-        if v["loo"] is None:
-            matrix, errs = _gather_study_matrix(study)
-            if errs:
-                raise _err(422, "子午线研究无法计算留一法", errs)
-            loo = leave_one_out(
-                matrix["psi"],
-                matrix["alpha"],
-                matrix["signals"],
-                matrix["radii"],
-                matrix["inner"],
-                matrix["outer"],
-                matrix["R"],
-                matrix["rim"],
-                matrix["wavelength_nm"],
-                confidence_level=study["confidence_level"],
-                axis_stability_deg=study["axis_stability_deg"],
+        # 严格使用该版本冻结的来源与信号复算，不读取研究当前来源/排除状态
+        if v["loo"] is not None:
+            loo = v["loo"]
+            on_demand = False
+        else:
+            loo = loo_from_fit_result(
+                v["result"], axis_stability_deg=db.get_study(study_id)["axis_stability_deg"]
             )
-            return {
-                "study_id": study_id,
-                "version_no": v["version_no"],
-                "computed_on_demand": True,
-                "loo": loo,
-            }
-        return {"study_id": study_id, "version_no": v["version_no"], "loo": v["loo"]}
+            on_demand = True
+        return {
+            "study_id": study_id,
+            "version_no": v["version_no"],
+            "computed_on_demand": on_demand,
+            "loo": loo,
+        }
 
     @app.get("/api/meridian-studies/{study_id}/versions/{version_no}")
     def get_study_version(study_id: int, version_no: int):
@@ -1923,9 +1915,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
             if payload.version_no is not None
             else db.get_latest_study_version(study_id)
         )
+        # 严格按所选版本冻结：参与求解的来源取该版本 active_source_ids，
+        # 排除状态取该版本写入时的排除快照，不读取研究当前来源状态。
+        active_ids = set(v["active_source_ids"])
+        by_id = {s["id"]: s for s in study["sources"]}
+        excluded_by_index = {
+            e["source_index"]: e for e in v["excluded_snapshot"]
+        }
         sources = []
-        for s in study["sources"]:
+        for s in sorted(study["sources"], key=lambda x: x["source_index"]):
             sv = db.get_version(s["test_id"], s["version_no"])
+            was_active = s["id"] in active_ids
+            snap = excluded_by_index.get(s["source_index"])
             sources.append(
                 {
                     "source_index": s["source_index"],
@@ -1935,13 +1936,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
                     "mirror_rotation_deg": s["mirror_rotation_deg"],
                     "knife_diameter_azimuth_deg": s["knife_diameter_azimuth_deg"],
                     "sampled_at": s["sampled_at"],
-                    "excluded": bool(s["excluded"]),
-                    "exclude_reason": s["exclude_reason"],
+                    "active_in_frozen_version": was_active,
+                    "excluded": not was_active,
+                    "exclude_reason": snap["reason"] if snap else None,
                 }
             )
+        n_active = sum(1 for x in sources if x["active_in_frozen_version"])
         freeze = {
             "study_id": study_id,
             "frozen_version_no": v["version_no"],
+            "n_active_sources": n_active,
             "sources": sources,
             "angle_convention": study["angle_convention"],
             "fit_params": {

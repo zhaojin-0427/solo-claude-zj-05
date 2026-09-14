@@ -130,6 +130,69 @@ def test_version_detail_has_per_radius_and_ci(client):
     assert len(loo["leave_one_out"]) == 8
 
 
+def test_reject_missing_sampled_at(client):
+    ids = _make_batches(client, n=4)
+    src = _sources(ids)
+    for s in src:
+        s.pop("sampled_at")
+    r = client.post("/api/meridian-studies", json={"sources": src})
+    assert r.status_code == 422
+    assert "sampled_at" in r.text
+
+
+def test_four_separable_sources_solve_without_intercept(client):
+    # 4 份 ψ/α 独立变化的来源：4 个谐波系数满秩，应正常创建并求解（非 422）
+    psi4 = [0.0, 15.0, 30.0, 45.0]
+    alpha4 = [0.0, 15.0, 45.0, 60.0]
+    ids = _make_batches(client, n=4)
+    src = _sources(ids, psi=psi4, alpha=alpha4)
+    r = client.post("/api/meridian-studies", json={"sources": src, "loo": False})
+    assert r.status_code == 201, r.text
+    assert r.json()["version"]["summary"]["rank"] == 4
+
+
+def test_historical_loo_uses_version_snapshot_not_current_state(client):
+    # 建研究（v1，8 份）→ 排除来源 0（v2）；查询 v1 的留一报告仍应基于 8 份来源
+    r, _ = _create_study(client, loo=False)
+    sid = r.json()["study"]["id"]
+    client.post(
+        f"/api/meridian-studies/{sid}/sources/exclude",
+        json={"source_index": 0, "reason": "异常", "loo": False},
+    )
+    # v1 未存留一（loo=False）→ 按 v1 冻结结果按需复算，仍是 8 份来源
+    resp1 = client.get(f"/api/meridian-studies/{sid}/loo?version_no=1").json()
+    assert resp1["computed_on_demand"] is True
+    assert len(resp1["loo"]["leave_one_out"]) == 8
+    # v2 的留一为 7 份
+    resp2 = client.get(f"/api/meridian-studies/{sid}/loo?version_no=2").json()
+    assert len(resp2["loo"]["leave_one_out"]) == 7
+    # 最新（默认）即 v2
+    latest = client.get(f"/api/meridian-studies/{sid}/loo").json()
+    assert latest["version_no"] == 2
+    assert len(latest["loo"]["leave_one_out"]) == 7
+
+
+def test_finalize_selected_version_freezes_its_source_set(client):
+    # v1（8 份）→ 排除来源 0（v2）→ 指定定稿 v1：冻结包必须按 v1 的 8 份来源，
+    # 且每份 active_in_frozen_version=True，不混入当前排除状态。
+    r, _ = _create_study(client, loo=False)
+    sid = r.json()["study"]["id"]
+    client.post(
+        f"/api/meridian-studies/{sid}/sources/exclude",
+        json={"source_index": 0, "reason": "异常", "loo": False},
+    )
+    fin = client.post(
+        f"/api/meridian-studies/{sid}/finalize", json={"version_no": 1}
+    )
+    assert fin.status_code == 200, fin.text
+    fz = client.get(f"/api/meridian-studies/{sid}/freeze").json()["freeze"]
+    assert fz["frozen_version_no"] == 1
+    assert fz["n_active_sources"] == 8
+    assert len(fz["sources"]) == 8
+    assert all(s["active_in_frozen_version"] for s in fz["sources"])
+    assert all(not s["excluded"] for s in fz["sources"])
+
+
 def test_reject_fewer_than_four_sources(client):
     ids = _make_batches(client, n=4)
     payload = {"sources": _sources(ids)[:3]}
@@ -215,7 +278,8 @@ def test_append_source_and_solve(client):
     # 新批次（第 9 份）——再造一个角度
     extra_id = _make_batches(client, n=9)[-1]
     src = {"test_id": extra_id, "mirror_rotation_deg": 75.0,
-           "knife_diameter_azimuth_deg": 60.0}
+           "knife_diameter_azimuth_deg": 60.0,
+           "sampled_at": "2026-02-01T10:00:00+00:00"}
     resp = client.post(f"/api/meridian-studies/{sid}/sources", json={"sources": [src]})
     assert resp.status_code == 201, resp.text
     assert len(resp.json()["study"]["sources"]) == n_before + 1
@@ -229,7 +293,8 @@ def test_append_over_16_rejected(client):
     more = _make_batches(client, n=16)  # 新建 16 个批次
     sources = [
         {"test_id": t, "mirror_rotation_deg": float(10 + i),
-         "knife_diameter_azimuth_deg": float(5 + 3 * i)}
+         "knife_diameter_azimuth_deg": float(5 + 3 * i),
+         "sampled_at": f"2026-02-{i + 1:02d}T10:00:00+00:00"}
         for i, t in enumerate(more)
     ]
     # 分批追加，前 8 份（到 16）成功
@@ -332,7 +397,8 @@ def test_finalize_freezes_and_blocks_mutation(client):
     add = client.post(
         f"/api/meridian-studies/{sid}/sources",
         json={"sources": [{"test_id": ids[-1], "mirror_rotation_deg": 10.0,
-                           "knife_diameter_azimuth_deg": 10.0}]},
+                           "knife_diameter_azimuth_deg": 10.0,
+                           "sampled_at": "2026-02-01T10:00:00+00:00"}]},
     )
     assert add.status_code == 409
     ex = client.post(
@@ -383,9 +449,10 @@ def test_copy_study_resets_exclusion_and_allows_append(client):
     resp = client.post(
         f"/api/meridian-studies/{new_id}/sources",
         json={"sources": [{"test_id": more[-1], "mirror_rotation_deg": 80.0,
-                           "knife_diameter_azimuth_deg": 50.0}]},
+                           "knife_diameter_azimuth_deg": 50.0,
+                           "sampled_at": "2026-02-01T10:00:00+00:00"}]},
     )
-    assert resp.status_code == 201
+    assert resp.status_code == 201, resp.text
     assert resp.json()["version"]["summary"]["n_sources"] == 9
     # 原研究仍冻结
     assert client.get(f"/api/meridian-studies/{sid}").json()["study"]["status"] == "finalized"

@@ -25,17 +25,15 @@
   只能识别镜面分量；反之镜面不旋转时只能识别架位分量。要分离两者，ψ 与 α
   都须有非共线的角度散布。矩阵欠秩时不强行给出伪结果，而是逐分量指出缺口
   与补测建议（MeridianError.gaps）。
-- 截距 c（轴对称残余）在被谐波列张成（如 N=4 的一般角度）时自动剔除，
-  此时四个谐波系数仍可识别。
+可识别性在谐波 4 列上按正交投影判定（N=4 与 N≥5 通用）：某分量投影掉
+截距与另一分量后仍满秩即可识别。4 份来源且 ψ、α 的二次谐波方向独立时，
+4 个谐波系数满秩、直接拟合（不估轴对称截距 c，c 并入残差）；≥5 份且 c
+独立可估时再拟合截距。真正不可识别（角度共线/两分量混淆）时才报缺口。
 
-LA → 波前：面形 h(r,θ)=H(r)cos2(θ−φ)，子午斜率关系
-LA = −2R²/r·∂h/∂r ⇒ H′(r) = −r·A_LA(r)/(2R²)，从中心积分到口径边缘，
-波前 W = 2h（反射加倍）。
-
-主轴方向：逐区主轴直接由 LA 谐波系数 atan2/2 给出（镜面/架位各自坐标）。
-LA→面形积分含一次负号，使整体波前主轴相对 LA 主轴存在 90° 象限二义性
-（二次像散 cos2θ 的固有性质）；整体主轴取逐区 LA 主轴按环带面积的圆形
-平均，与逐区报告保持同一约定，积分只决定幅值与 RMS。
+LA → 波前：各半径的复 LA 谐波 A_j = c_j + i·s_j（保留相位）按环带面积
+积分 h = (1/2R²)∫₀^rim ρ·A(ρ) dρ，波前 W = 2h（反射加倍）。整体主轴由
+复积分辐角 atan2(Im h, Re h)/2 给出——不先取实幅值、不做逐区轴圆形平均，
+因而径向系数变号、α 独立变化时主轴与幅值都不失真。
 """
 from __future__ import annotations
 
@@ -145,8 +143,35 @@ def design_matrix(mirror_rot_deg, knife_az_deg) -> np.ndarray:
     )
 
 
-def _angle_gaps(psi: np.ndarray, alpha: np.ndarray, essential: list[bool]) -> list[str]:
-    """把不可识别列翻译成面向操作者的角度缺口说明。"""
+def _harmonic_identifiability(A_h: np.ndarray):
+    """在谐波 4 列矩阵上判定两对象散是否可识别（截距正交投影，N=4/≥5 通用）。
+
+    返回 (mirror_ok, lab_ok)。各自的两列（cos,sin）投影掉对方与截距后必须仍
+    满秩（rank 2），且镜面列与架位列不共线（否则两对象散混淆）。
+    """
+    n = A_h.shape[0]
+    ones = np.ones((n, 1))
+    M = A_h[:, 0:2]
+    L = A_h[:, 2:4]
+
+    def _proj_off(cols, basis):
+        if basis.shape[1] == 0:
+            return cols
+        Q, *_ = np.linalg.qr(basis, mode="reduced")
+        return cols - Q @ (Q.T @ cols)
+
+    # 镜面：投影掉截距 + 架位
+    Pm = _proj_off(M, np.column_stack([ones, L]))
+    mirror_ok = _norm_rank(Pm) >= 2
+    # 架位：投影掉截距 + 镜面
+    Pl = _proj_off(L, np.column_stack([ones, M]))
+    lab_ok = _norm_rank(Pl) >= 2
+    return mirror_ok, lab_ok
+
+
+def _angle_gaps(psi: np.ndarray, alpha: np.ndarray, mirror_ok: bool,
+                lab_ok: bool) -> list[str]:
+    """把真正不可识别的分量翻译成面向操作者的角度缺口说明。"""
     gaps: list[str] = []
 
     def _noncollinear(angles: np.ndarray) -> bool:
@@ -154,22 +179,37 @@ def _angle_gaps(psi: np.ndarray, alpha: np.ndarray, essential: list[bool]) -> li
         v = np.column_stack([np.cos(doubled), np.sin(doubled)])
         return _norm_rank(v) >= 2
 
-    if not (essential[_COL_MIRROR[0]] and essential[_COL_MIRROR[1]]):
+    def _collinear_between():
+        # 镜面 2 列与架位 2 列张成同一方向（α 的二次谐波落在 ψ 谐波空间），
+        # 两类像散在不含截距时也互相混淆
+        M2 = np.column_stack([
+            np.cos(2 * np.radians(psi)), np.sin(2 * np.radians(psi))
+        ])
+        L2 = np.column_stack([
+            np.cos(2 * np.radians(alpha)), np.sin(2 * np.radians(alpha))
+        ])
+        return _norm_rank(np.column_stack([M2, L2])) < 4
+
+    both_diverse = _noncollinear(psi) and _noncollinear(alpha)
+    if not mirror_ok:
         tip = "补充镜面旋转角不同的来源"
         if not _noncollinear(psi):
             tip = ("镜面旋转角只在 0°/90° 等共线方位取值，需补充旋转角相差"
                    "非 0°/90° 的来源")
-        gaps.append(
-            "镜面随转分量无法识别：" + tip + "（至少两个二次谐波下非共线的旋转角）"
-        )
-    if not (essential[_COL_LAB[0]] and essential[_COL_LAB[1]]):
+        elif both_diverse and _collinear_between():
+            tip = ("镜面旋转与刀口扫描直径方位同步变化（两者二次谐波方向共线），"
+                   "随镜面转动的面形分量与架位系统分量互相混淆，需让 ψ 与 α "
+                   "独立变化，或补充第 5 份来源以同时估计轴对称截距")
+        gaps.append("镜面随转分量无法识别：" + tip)
+    if not lab_ok:
         tip = "补充刀口扫描直径方位不同的来源"
         if not _noncollinear(alpha):
             tip = ("刀口扫描直径方位只在 0°/90° 等共线方位取值，需补充方位相差"
                    "非 0°/90° 的来源")
-        elif _noncollinear(psi):
-            tip = ("刀口扫描直径方位在各来源间无独立变化（与镜面旋转角共线），"
-                   "需在镜面旋转的同时改变刀口扫描直径方位")
+        elif both_diverse and _collinear_between():
+            tip = ("刀口扫描直径方位与镜面旋转角同步变化（两者二次谐波方向共线），"
+                   "架位固定的系统分量与随镜面转动分量互相混淆，需让 ψ 与 α "
+                   "独立变化，或补充第 5 份来源以同时估计轴对称截距")
         gaps.append("架位固定分量无法识别：" + tip)
     return gaps
 
@@ -178,91 +218,67 @@ def _angle_gaps(psi: np.ndarray, alpha: np.ndarray, essential: list[bool]) -> li
 
 
 def _zone_radial_weights(inner, outer, rim: float, R: float):
-    """各分区 LA 幅值对边缘面形 H(rim) 的贡献权重（mm→mm）。
+    """各分区 LA 谐波复系数对边缘波前复振幅的贡献权重（实数，mm→mm）。
 
-    LA 像差幅值在分区物理环带 [inner_j, outer_j] 内按该区测量值（等效半径
-    r_j 处）代表；未被环带覆盖的中心孔（0..inner_0）按最内区幅值延拓，
-    外缘（outer_last..rim）按最外区幅值延拓（与 optics 模块向中心/边缘
-    外推的约定一致），使幅值恒为 A 时 Σw_j = −rim²/(4R²)，与解析解一致。
-    w_j = −∫ρ dρ/(2R²)，各分区覆盖区间：
-      首区 [0, (outer_0+inner_1)/2]（梯形分担），末区延伸到 rim，
-      中间区在相邻等效半径中点处相接。
+    LA 像散幅值在相邻等效半径的中点之间按该分区测量值代表；首区从 0
+    起、末区延伸到口径边缘 rim，使幅值恒为 A 时 Σw = rim²/(4R²)
+    （波前 = 2·(1/2R²)·A·rim²/2 = A·rim²/(2R²)，取正号以保持
+    LA 主轴与波前主轴一致，符号为像散主轴 90° 象限的约定）。
+    返回按原始（未排序）分区顺序的权重。
     """
     radii_ref = np.sqrt((np.asarray(inner) ** 2 + np.asarray(outer) ** 2) / 2.0)
     order = np.argsort(radii_ref)
     r = radii_ref[order]
     m = r.size
-    # 分区之间的边界取相邻等效半径中点；首边界 0，末边界 rim
     edges = np.zeros(m + 1)
     edges[0] = 0.0
     for j in range(m - 1):
         edges[j + 1] = 0.5 * (r[j] + r[j + 1])
     edges[m] = rim
-    w_sorted = -(edges[1:] ** 2 - edges[:-1] ** 2) / (4.0 * R * R)
+    # 波前取 +(1/2R²)∫ρdρ（即 +∫ρdρ/(2R²)）；∫ρdρ=(e_{j+1}²−e_j²)/2
+    w_sorted = (edges[1:] ** 2 - edges[:-1] ** 2) / (4.0 * R * R)
     w = np.zeros(m)
     w[order] = w_sorted
     return w
 
 
-def _radial_surface_profile(prof_c, prof_s, radii, inner_radii, outer_radii,
-                            rim: float, R: float, n_grid: int = 600):
-    """由逐区 LA 谐波系数重建口径上的面形复振幅 h(r)=hc+i hs（mm）。
+def _radial_complex_profile(profile_complex, radii, rim: float, R: float,
+                            n_grid: int = 600):
+    """由逐区 LA 谐波**复**系数重建口径上的波前复振幅包络 W(r)/2（mm）。
 
-    LA 幅值在每个分区物理环带内按该区测量值（等效半径 r_j 处）代表，
-    相邻分区在等效半径中点相接，中心 0..首中点幅值为零（光轴处轴对称残差
-    为零），末段延伸到口径边缘 rim。inner/outer 仅用于接口对称，分段以
-    等效半径中点为准。h(r) 用细密半径网格数值积分 h′=−r·A/(2R²)。
-    返回 (r_grid, hc, hs)。
+    profile_complex[j] = c_j + i·s_j（保留相位，不先取幅值）。复系数在相邻
+    等效半径中点之间分段常数（首段从 0 起按首区值、末段延伸到 rim），逐段
+    积分 h(r) = (1/2R²)∫₀ʳ ρ·A(ρ) dρ（取正号保持主轴方向）。
+    返回 (r_grid, 复包络 h)。波前 = 2·h。
     """
     radii = np.asarray(radii, dtype=float)
     order = np.argsort(radii)
     r = radii[order]
-    cc = np.asarray(prof_c, dtype=float)[order]
-    ss = np.asarray(prof_s, dtype=float)[order]
+    a = np.asarray(profile_complex, dtype=complex)[order]
     m = r.size
-    # 幅值在相邻等效半径的中点之间按该分区常数分段；首段从 0（光轴幅值为零，
-    # 线性到首个中点），末段延伸到口径边缘 rim。
     edges = [0.0]
     for j in range(m - 1):
         edges.append(0.5 * (r[j] + r[j + 1]))
     edges.append(rim)
 
     def amp_at(rho):
-        if rho <= 0:
-            return 0.0, 0.0
         for j in range(m):
             lo, hi = edges[j], edges[j + 1]
-            if lo < rho <= hi or (j == m - 1 and rho >= hi):
-                return cc[j], ss[j]
-        return cc[-1], ss[-1]
+            if j == 0:
+                if rho <= hi:
+                    return a[0]
+            elif lo < rho <= hi:
+                return a[j]
+        return a[-1]
 
     g = np.linspace(0.0, rim, n_grid)
-    hc = np.zeros_like(g)
-    hs = np.zeros_like(g)
+    h = np.zeros_like(g, dtype=complex)
     for k in range(1, g.size):
         ra, rb = g[k - 1], g[k]
-        ca, sa = amp_at(ra)
-        cb, sb = amp_at(rb)
-        # h = −1/(2R²)∫ρ·A dρ；梯形 ∫_ra^rb ρ·A dρ ≈ Δr(ra·A_a+rb·A_b)/2
-        hc[k] = hc[k - 1] - (rb - ra) * (ra * ca + rb * cb) / (4.0 * R * R)
-        hs[k] = hs[k - 1] - (rb - ra) * (ra * sa + rb * sb) / (4.0 * R * R)
-    return g, hc, hs
-
-
-def _integrate_astigmatism(profile_c, profile_s, radii, inner_radii, outer_radii,
-                           rim: float, R: float):
-    """逐半径 LA 谐波系数 → 边缘面形复振幅 H(rim) 与各分区线性权重。
-
-    返回 (H_rim(complex), weights(M))。边缘幅值与权重用于置信区间传播；
-    径向 RMS 由 _radial_surface_profile 在细密网格上计算。
-    """
-    radii = np.asarray(radii, dtype=float)
-    order = np.argsort(radii)
-    w = _zone_radial_weights(inner_radii, outer_radii, rim, R)
-    c = np.asarray(profile_c, dtype=float)
-    s = np.asarray(profile_s, dtype=float)
-    H_rim = complex(np.sum(w * c) + 1j * np.sum(w * s))
-    return H_rim, w
+        aa, ab = amp_at(ra), amp_at(rb)
+        # h = (1/2R²)∫ρ·A dρ；梯形 ∫_ra^rb ρ·A dρ ≈ Δr(ra·A_a+rb·A_b)/2
+        h[k] = h[k - 1] + (rb - ra) * (ra * aa + rb * ab) / (4.0 * R * R)
+    return g, h
 
 
 # ---------------- 主拟合 ----------------
@@ -300,22 +316,26 @@ def fit_harmonics(
             ["补充更多不同镜面旋转角 / 刀口方位的复测来源（研究档案 4~16 份）"],
         )
 
+    # 谐波 4 列的可识别性在正交投影下判定（N=4 或 N≥5 通用）：每个分量投影
+    # 掉截距与另一分量后仍须满秩。这样 4 份来源且 4 个谐波系数满秩时直接求解
+    # （不拟合截距）；只有真正不可识别的角度组合才报缺口。
     A_full = design_matrix(psi, alpha)
     rank_full = _norm_rank(A_full)
-    essential = [
-        rank_full > _norm_rank(np.delete(A_full, j, axis=1))
-        for j in range(A_full.shape[1])
-    ]
-    gaps = _angle_gaps(psi, alpha, essential)
+    A_harm = A_full[:, 1:5]
+    mirror_ok, lab_ok = _harmonic_identifiability(A_harm)
+    gaps = _angle_gaps(psi, alpha, mirror_ok, lab_ok)
     if gaps:
         raise MeridianError(
             "角度组合使二次谐波拟合矩阵欠秩，镜面随转分量与架位固定分量无法分离",
             gaps,
         )
 
-    # 截距被谐波列张成时不单独拟合（否则与谐波共线）；两对象散分量均已识别。
-    use_cols = [_COL_INTERCEPT] if essential[_COL_INTERCEPT] else []
-    use_cols += list(_COL_MIRROR) + list(_COL_LAB)
+    # 4 个谐波系数在 4 列上满秩：N=4 时只能拟合谐波（截距并入残差，轴对称
+    # 残余不进入像散）；N≥5 且截距独立可估时再拟合截距。
+    use_cols = list(_COL_MIRROR) + list(_COL_LAB)
+    A4 = A_full[:, use_cols]
+    if n >= 5 and _norm_rank(np.column_stack([np.ones(n), A4])) > _norm_rank(A4):
+        use_cols = [_COL_INTERCEPT] + use_cols
     use_cols.sort()
     A = A_full[:, use_cols]
     p = A.shape[1]
@@ -430,71 +450,47 @@ def fit_harmonics(
             }
         )
 
-    # 整体像散波前：按分区物理环带把 LA 幅值积分到口径边缘（镜面 / 架位
-    # 分别积分，保留各自相位）。
-    #
-    # 注意：LA 剖面经 H′ = −r·A_LA/(2R²) 积分会整体引入一次符号翻转，使由
-    # H 算出的角度与直接从 LA 谐波得到的主轴相差 90°（二次像散主轴本有 90°
-    # 象限二义性）。为与各半径逐区报告一致，整体主轴取逐区 LA 主轴按环带
-    # 面积权重 |w_j| 的圆形平均；积分只决定幅值/RMS（不敏感于符号）。
-    def wavefront_block(prof_c, prof_s, zone_blocks, i_c_coef, i_s_coef, axis_name: str):
-        H_rim, w = _integrate_astigmatism(
-            prof_c, prof_s, radii, inner_radii, outer_radii, rim, R
-        )
-        w_amp_mm = float(np.abs(H_rim))
-        w_amp_nm = 2.0 * w_amp_mm * NM_PER_MM
+    # 整体像散波前：镜面 / 架位分别把**复** LA 谐波系数（c+i·s，保留相位）
+    # 按环带面积积分到口径边缘。主轴直接由复数积分的辐角给出，不做逐区轴的
+    # 圆形平均（后者会被径向系数变号污染），因此 α 独立变化、径向幅值起伏时
+    # 主轴与幅值都不失真。
+    def wavefront_block(prof_c, prof_s, i_c_coef, i_s_coef, axis_name: str):
+        w = _zone_radial_weights(inner_radii, outer_radii, rim, R)
+        prof = np.asarray(prof_c, dtype=float) + 1j * np.asarray(prof_s, dtype=float)
+        # 边缘波前复振幅（面形，取正号保持与 LA 主轴同象限）：H = Σ w_j·A_j
+        H = complex(np.sum(w * prof))
+        h_amp_mm = float(np.abs(H))
+        w_amp_nm = 2.0 * h_amp_mm * NM_PER_MM  # 波前 = 2·面形
+        axis = _axis_deg(H.real, H.imag)
         cov2 = (
             sigma2 * AtA_inv[np.ix_([i_c_coef, i_s_coef], [i_c_coef, i_s_coef])]
             if sigma2 is not None
             else None
         )
-        se_amp_nm = None
-        if cov2 is not None and w_amp_mm > 0:
-            denom = np.hypot(prof_c, prof_s)
-            gcos = w * prof_c / denom
-            gsin = w * prof_s / denom
-            var_H = (
-                float((gcos**2).sum()) * cov2[0, 0]
-                + float((gsin**2).sum()) * cov2[1, 1]
-                + 2.0 * float((gcos * gsin).sum()) * cov2[0, 1]
-            )
-            se_amp_nm = 2.0 * NM_PER_MM * math.sqrt(max(0.0, var_H))
-        # 主轴：逐区 LA 主轴按环带面积权重 |w| 做二次谐波圆形平均
-        q = np.abs(w)
-        qsum = float(q.sum())
-        zone_axes = np.asarray([z["axis_deg"] for z in zone_blocks])
-        sx = float((q * np.cos(np.radians(2.0 * zone_axes))).sum())
-        sy = float((q * np.sin(np.radians(2.0 * zone_axes))).sum())
-        axis = _axis_deg(sx, sy) if qsum > 0 else 0.0
-        se_axis_deg = None
-        if cov2 is not None and qsum > 0:
-            Qc = q / qsum
-            var_sum = 0.0
-            for j in range(m):
-                A_j = math.hypot(prof_c[j], prof_s[j])
-                if A_j <= 0:
-                    continue
-                cv, sv = prof_c[j] / A_j, prof_s[j] / A_j
-                g = (Qc[j] / A_j) * np.array(
-                    [[sv * sv, -cv * sv], [-cv * sv, cv * cv]]
-                )
-                var_sum += float(np.trace(g @ cov2 @ g.T))
-            se_axis_deg = math.degrees(0.5 * math.sqrt(max(0.0, var_sum)))
-        # 面积加权波前 RMS：在细密半径网格上重建 h(r)（运行积分）。径向重建
-        # 只关心幅值轮廓（相位随半径小幅变化、逐区局部），故用各分区谐波
-        # 幅值 hypot(prof_c,prof_s) 作为剖面；|h(r)| 按面元 ∝ r 加权，
-        # 角向 <cos²2θ>=1/2。
-        prof_amp = np.hypot(prof_c, prof_s)
-        g_r, hc_g, hs_g = _radial_surface_profile(
-            prof_amp, np.zeros_like(prof_amp), radii, inner_radii,
-            outer_radii, rim, R
-        )
-        h_abs = np.hypot(hc_g, hs_g)
-        # 均匀 dr 网格：面积加权均值 = Σ r·x / Σ r（dr 与 2π 约去）；
-        # 波前 = 2·面形（反射加倍）。
+        se_amp_nm = se_axis_deg = None
+        if cov2 is not None and h_amp_mm > 0:
+            # Hc=Σw·c, Hs=Σw·s；跨半径系数独立（同设计矩阵、σ² 块对角）
+            var_c = float((w**2).sum()) * cov2[0, 0]
+            var_s = float((w**2).sum()) * cov2[1, 1]
+            cov_cs = float((w**2).sum()) * cov2[0, 1]
+            Hc, Hs = H.real, H.imag
+            var_amp = (
+                Hc * Hc * var_c + Hs * Hs * var_s + 2 * Hc * Hs * cov_cs
+            ) / (h_amp_mm**2)
+            se_amp_nm = 2.0 * NM_PER_MM * math.sqrt(max(0.0, var_amp))
+            # θ = atan2(Hs,Hc)/2
+            var_axis_rad = (
+                Hs * Hs * var_c + Hc * Hc * var_s - 2 * Hc * Hs * cov_cs
+            ) / (4.0 * h_amp_mm**4)
+            se_axis_deg = math.degrees(math.sqrt(max(0.0, var_axis_rad)))
+        # 面积加权 RMS：在细密半径网格上用复系数重建波前包络（保留相位），
+        # |h(r)| 按面元 ∝ r 加权；角向 <cos²2θ>=1/2。
+        g_r, h_g = _radial_complex_profile(prof, radii, rim, R)
+        h_abs = np.abs(h_g)
+        # 均匀 dr：Σr/Σr 即面积加权均值；波前 = 2·面形
         peak_mm2 = float((g_r * h_abs**2).sum()) / float(g_r.sum())
         rms_peak_nm = 2.0 * math.sqrt(peak_mm2) * NM_PER_MM
-        rms_wavefront_nm = rms_peak_nm / math.sqrt(2.0)  # 角向 <cos²2θ>=1/2
+        rms_wavefront_nm = rms_peak_nm / math.sqrt(2.0)
         return {
             f"principal_axis_{axis_name}_deg": axis,
             "rim_wavefront_amplitude_nm": w_amp_nm,
@@ -505,8 +501,6 @@ def fit_harmonics(
             "wavefront_rms_waves": rms_wavefront_nm / wavelength_nm,
             "peak_profile_rms_nm": rms_peak_nm,
             "peak_profile_rms_waves": rms_peak_nm / wavelength_nm,
-            "angular_rms_nm": rms_wavefront_nm,
-            "angular_rms_waves": rms_wavefront_nm / wavelength_nm,
             "rim_amplitude_ci_nm": [
                 max(0.0, w_amp_nm - tcrit * se_amp_nm),
                 w_amp_nm + tcrit * se_amp_nm,
@@ -521,10 +515,8 @@ def fit_harmonics(
             else None,
         }
 
-    ast_m = wavefront_block(prof_mc, prof_ms, [z["mirror"] for z in zone_rows],
-                            i_mc, i_ms, "mirror")
-    ast_l = wavefront_block(prof_lc, prof_ls, [z["lab_fixed"] for z in zone_rows],
-                            i_lc, i_ls, "lab")
+    ast_m = wavefront_block(prof_mc, prof_ms, i_mc, i_ms, "mirror")
+    ast_l = wavefront_block(prof_lc, prof_ls, i_lc, i_ls, "lab")
 
     # 最可疑区段：扣除全局二次像散后，单来源标准化残差最突出的半径（局部
     # 缺陷/某次上机异常，区别于随角度平滑变化的像散）。用最大绝对值而非均值，
@@ -555,6 +547,17 @@ def fit_harmonics(
         else "残差最大的半径区段（有效自由度为 0，无法标准化）",
     }
 
+    # 冻结本次求解所用来源的角度（顺序与信号矩阵行一致）；配合分区信号即可
+    # 不依赖研究当前状态复算留一法/重解（历史版本严格使用该快照）。
+    frozen_sources = [
+        {
+            "row_index": int(i),
+            "mirror_rotation_deg": float(psi[i]),
+            "knife_diameter_azimuth_deg": float(alpha[i]),
+        }
+        for i in range(n)
+    ]
+
     return {
         "n_sources": n,
         "n_zones": m,
@@ -570,7 +573,16 @@ def fit_harmonics(
         "residual_dof": dof_total,
         "residual_sigma_mm": math.sqrt(sigma2) if sigma2 is not None else None,
         "convention": ANGLE_CONVENTION,
+        "constants": {
+            "radius_of_curvature_mm": float(R),
+            "rim_radius_mm": float(rim),
+            "wavelength_nm": float(wavelength_nm),
+            "confidence_level": float(confidence_level),
+        },
+        "frozen_sources": frozen_sources,
         "radii_mm": [float(r) for r in radii],
+        "inner_radii_mm": [float(x) for x in inner_radii],
+        "outer_radii_mm": [float(x) for x in outer_radii],
         "zones": zone_rows,
         "astigmatism": {
             "wavelength_nm": float(wavelength_nm),
@@ -690,3 +702,45 @@ def extract_zone_signals(version_result: dict, field: str = "la_residual") -> li
             raise MeridianError(f"分区 {z['index']} 的 {field} 不是有限数值")
         vals.append(float(v))
     return vals
+
+
+def signals_from_fit_result(fit_result: dict) -> list[list[float]]:
+    """从研究版本结果还原 N×M 信号矩阵（每份来源在每分区的观测 LA，mm）。
+
+    per_source 按分区存储且行序与 frozen_sources 一致，重建后供留一法在不访问
+    研究当前状态的情况下严格按该版本快照复算。
+    """
+    zones = sorted(fit_result["zones"], key=lambda z: z["index"])
+    if not zones:
+        raise MeridianError("版本结果中没有分区数据")
+    n = fit_result["n_sources"]
+    matrix = [[0.0] * len(zones) for _ in range(n)]
+    for j, z in enumerate(zones):
+        rows = sorted(z["per_source"], key=lambda p: p["source_index"])
+        if len(rows) != n:
+            raise MeridianError("版本 per_source 行数与 n_sources 不一致")
+        for i, p in enumerate(rows):
+            matrix[i][j] = float(p["observed_mm"])
+    return matrix
+
+
+def loo_from_fit_result(fit_result: dict, axis_stability_deg: float = 15.0) -> dict:
+    """严格按某条研究版本冻结的来源/信号复算留一法（不混入研究当前状态）。"""
+    c = fit_result["constants"]
+    src = fit_result["frozen_sources"]
+    psi = [s["mirror_rotation_deg"] for s in src]
+    alpha = [s["knife_diameter_azimuth_deg"] for s in src]
+    Y = signals_from_fit_result(fit_result)
+    return leave_one_out(
+        psi,
+        alpha,
+        Y,
+        fit_result["radii_mm"],
+        fit_result["inner_radii_mm"],
+        fit_result["outer_radii_mm"],
+        c["radius_of_curvature_mm"],
+        c["rim_radius_mm"],
+        c["wavelength_nm"],
+        confidence_level=c["confidence_level"],
+        axis_stability_deg=axis_stability_deg,
+    )

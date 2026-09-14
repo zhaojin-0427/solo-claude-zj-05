@@ -235,7 +235,7 @@ class StudySourceIn(BaseModel):
     version_no: int | None = None  # 缺省取该批次最新版本（创建时解析并冻结）
     mirror_rotation_deg: float = Field(ge=0.0, lt=360.0)  # 镜面在支架上的旋转角
     knife_diameter_azimuth_deg: float = Field(ge=0.0, lt=360.0)  # 刀口扫描直径方位
-    sampled_at: datetime | None = None  # 该来源采样时间；naive 按 UTC
+    sampled_at: datetime  # 该来源采样时间，必填；naive 按 UTC
 
 
 class StudyCreateIn(BaseModel):

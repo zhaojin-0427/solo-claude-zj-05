@@ -15,6 +15,7 @@ from foucault.meridian import (
     extract_zone_signals,
     fit_harmonics,
     leave_one_out,
+    loo_from_fit_result,
 )
 
 RADII = [20.0, 50.0, 80.0]
@@ -135,14 +136,49 @@ def test_exactly_just_identified_has_null_ci():
 
 
 def test_n4_generic_angles_underdetermined():
-    # 5 参数（截距+4 谐波）只有 4 个观测：一般角度下秩为 4 且被剔除的是某个
-    # 谐波方向，镜面/架位分量无法干净分离 → 欠秩缺口（需要第 5 份来源）。
+    # 5 参数（截距+4 谐波）只有 4 个观测：一般角度下镜面/架位谐波方向共线，
+    # 不含截距也无法分离两对象散 → 欠秩缺口（需要第 5 份来源或独立角度）。
     psi4 = [0.0, 30.0, 60.0, 90.0]
     alpha4 = [0.0, 90.0, 30.0, 135.0]
     y = make_signals(psi=psi4, alpha=alpha4, noise=0.0)
     with pytest.raises(MeridianError) as ei:
         fit_harmonics(psi4, alpha4, y, RADII, INNER, OUTER, R, RIM, LAM)
     assert ei.value.gaps  # 至少指出一个无法识别的分量
+
+
+def test_n4_separable_harmonics_solves_without_intercept():
+    # 4 份来源且 ψ、α 的二次谐波方向独立（4 个谐波系数满秩）：不含截距即可
+    # 分离两对象散，应正常求解而非 422。
+    psi4 = [0.0, 15.0, 30.0, 45.0]
+    alpha4 = [0.0, 15.0, 45.0, 60.0]
+    y = make_signals(psi=psi4, alpha=alpha4, noise=0.0)
+    res = fit_harmonics(psi4, alpha4, y, RADII, INNER, OUTER, R, RIM, LAM)
+    assert res["rank"] == 4
+    assert "intercept" not in res["fitted_columns"]
+    z = res["zones"][-1]
+    assert abs(z["mirror"]["axis_deg"] - 30.0) < 1e-6
+    assert abs(z["lab_fixed"]["axis_deg"] - 110.0) < 1e-6
+    # 冻结快照可重建留一法
+    loo = loo_from_fit_result(res)
+    assert len(loo["leave_one_out"]) == 4
+
+
+def test_complex_aggregation_preserves_phase_with_independent_alpha():
+    # 纯镜面像散、幅值随半径变号（径向剖面），α 独立变化：复数积分保相位，
+    # 整体主轴不得被变号系数带偏 90°。
+    psi8 = [0.0, 45.0, 90.0, 30.0, 60.0, 120.0, 150.0, 20.0]
+    alpha8 = [0.0, 0.0, 45.0, 90.0, 135.0, 45.0, 90.0, 0.0]
+    y = make_signals(amp_m=0.02, amp_l=0.0, noise=0.0,
+                     radial=lambda rr: 0.6 - 0.8 * rr / 90.0,
+                     psi=psi8, alpha=alpha8)
+    res = fit_harmonics(psi8, alpha8, y, RADII, INNER, OUTER, R, RIM, LAM)
+    am = res["astigmatism"]["mirror"]
+    # 每区轴在 30° 或 120°（变号的 90° 象限）；复数汇总回到输入 30° 象限
+    for z in res["zones"]:
+        assert abs(z["mirror"]["axis_deg"] - 30.0) < 1e-6 or \
+            abs(z["mirror"]["axis_deg"] - 120.0) < 1e-6
+    assert abs(am["principal_axis_mirror_deg"] - 30.0) < 2.0
+    assert am["rim_wavefront_amplitude_nm"] > 0
 
 
 def test_n5_full_model_just_identified():
