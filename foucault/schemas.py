@@ -219,3 +219,70 @@ class SessionExcludeIn(BaseModel):
 class SessionLockIn(BaseModel):
     seqs: list[int] | None = Field(default=None, min_length=1)
     all_collected: bool = False  # True → 锁定全部已采集测位
+
+
+# ---------------- 子午线复测研究 ----------------
+
+# 角度约定（创建研究时冻结）：从光学面观察，0° 为参考方向，逆时针为正，单位度。
+# 直径方位与像散主轴以 180° 为周期；本服务统一按度接收。
+StudySignalField = Literal["la_residual", "la_error"]
+
+
+class StudySourceIn(BaseModel):
+    """研究来源：一份冻结的分析版本 + 该来源的角度与采样时间。"""
+
+    test_id: int
+    version_no: int | None = None  # 缺省取该批次最新版本（创建时解析并冻结）
+    mirror_rotation_deg: float = Field(ge=0.0, lt=360.0)  # 镜面在支架上的旋转角
+    knife_diameter_azimuth_deg: float = Field(ge=0.0, lt=360.0)  # 刀口扫描直径方位
+    sampled_at: datetime | None = None  # 该来源采样时间；naive 按 UTC
+
+
+class StudyCreateIn(BaseModel):
+    """创建子午线复测研究档案：同一面镜 4~16 份冻结分析版本组成独立档案。
+
+    口径、曲率半径与遮罩分区必须一致，否则 422 拒绝；角度组合欠秩时求解
+    返回 422 并逐分量指出角度缺口。拟合参数（信号字段、置信水平等）在研究
+    级冻结，保证各版本结果可比较。
+    """
+
+    name: str | None = None
+    notes: str | None = None
+    sources: list[StudySourceIn] = Field(min_length=4, max_length=16)
+    signal_field: StudySignalField = "la_residual"
+    confidence_level: float = Field(default=0.95, gt=0.0, lt=1.0)
+    axis_stability_deg: float = Field(default=15.0, gt=0.0, le=90.0)
+    loo: bool = True  # 创建求解时附带留一法稳定性比较
+
+
+class StudyAppendIn(BaseModel):
+    """向开放研究追加一批新来源（复制研究后追加新批次重新求解）。"""
+
+    sources: list[StudySourceIn] = Field(min_length=1, max_length=16)
+    solve: bool = True
+
+
+class StudyExcludeIn(BaseModel):
+    """注明原因排除单次来源，并用留一法比较结论是否稳定（不删除来源行）。"""
+
+    source_index: int = Field(ge=0)
+    reason: str = Field(min_length=1, max_length=500)
+    solve: bool = True  # 排除后自动重新求解
+    loo: bool = True
+
+
+class StudySolveIn(BaseModel):
+    loo: bool = True
+
+
+class StudyCopyIn(BaseModel):
+    """复制研究：来源引用原样带入（排除状态重置），形成新的开放研究。"""
+
+    name: str | None = None
+    notes: str | None = None
+
+
+class StudyFinalizeIn(BaseModel):
+    """定稿冻结：来源版本、角度约定、拟合参数、输入哈希；此后不可改写。"""
+
+    version_no: int | None = None  # 缺省冻结最新求解版本

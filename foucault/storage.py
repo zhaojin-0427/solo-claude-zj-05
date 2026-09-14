@@ -10,6 +10,13 @@
 版本的引用与采集计划（测次序列），逐笔读数（含补测 attempt、剔除原因、
 锁定/冻结标记）只增不改；定稿时写入冻结包哈希并关联自动生成的测试批次，
 此后原始记录全部冻结，重复定稿幂等返回同一批次。
+
+子午线复测研究（meridian_studies + meridian_sources + meridian_versions）：
+研究把同一面镜 4~16 份**冻结的分析版本**组成独立档案，逐来源记录镜面旋转角、
+刀口扫描直径方位与采样时间；来源引用（test_id + version_no）一旦追加不改，
+排除只置标记（注明原因）不删行。每次求解写一条不可变研究版本（输入哈希、
+参与来源、排除快照、谐波结果、留一报告）；定稿冻结来源版本、角度约定、拟合
+参数与输入哈希，此后追加/排除/重解都被拒绝并返回既有冻结结果。
 """
 from __future__ import annotations
 
@@ -121,6 +128,47 @@ CREATE TABLE IF NOT EXISTS session_readings (
 );
 CREATE INDEX IF NOT EXISTS idx_session_readings_session
     ON session_readings(session_id);
+CREATE TABLE IF NOT EXISTS meridian_studies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'open',   -- open | finalized
+    created_at TEXT NOT NULL,
+    finalized_at TEXT,
+    -- 冻结的研究级拟合参数
+    signal_field TEXT NOT NULL,            -- la_residual | la_error
+    confidence_level REAL NOT NULL,
+    axis_stability_deg REAL NOT NULL,
+    angle_convention_json TEXT NOT NULL,
+    input_hash TEXT,                       -- 定稿冻结包哈希
+    freeze_json TEXT                       -- 定稿冻结包（来源、参数、输入哈希）
+);
+CREATE TABLE IF NOT EXISTS meridian_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id INTEGER NOT NULL REFERENCES meridian_studies(id) ON DELETE CASCADE,
+    source_index INTEGER NOT NULL,         -- 档案内固定序号（追加递增，排除不改号）
+    test_id INTEGER NOT NULL REFERENCES tests(id),
+    version_no INTEGER NOT NULL,
+    mirror_rotation_deg REAL NOT NULL,
+    knife_diameter_azimuth_deg REAL NOT NULL,
+    sampled_at TEXT,
+    added_at TEXT NOT NULL,
+    excluded INTEGER NOT NULL DEFAULT 0,
+    exclude_reason TEXT,
+    UNIQUE (study_id, test_id, version_no)
+);
+CREATE TABLE IF NOT EXISTS meridian_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    study_id INTEGER NOT NULL REFERENCES meridian_studies(id) ON DELETE CASCADE,
+    version_no INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    input_hash TEXT NOT NULL,              -- 参与拟合的有效输入哈希
+    active_source_ids_json TEXT NOT NULL,  -- 本次求解使用的来源 ID（顺序）
+    excluded_snapshot_json TEXT NOT NULL,  -- 当时被排除的来源（含原因）
+    result_json TEXT NOT NULL,
+    loo_json TEXT,
+    UNIQUE (study_id, version_no)
+);
 """
 
 # tests 表后加列（老库迁移）：批次引用的遮罩方案与版本
@@ -687,3 +735,286 @@ class Database:
             )
             self._conn.commit()
             return {"status": "finalized", "test_id": test_id}
+
+    # ---------------- 子午线复测研究 ----------------
+
+    def create_study(self, record: dict) -> int:
+        """创建开放状态的研究档案；record 含名称、拟合参数与角度约定。"""
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO meridian_studies
+                   (name, notes, status, created_at, signal_field,
+                    confidence_level, axis_stability_deg, angle_convention_json)
+                   VALUES (?, ?, 'open', ?, ?, ?, ?, ?)""",
+                (
+                    record.get("name"),
+                    record.get("notes"),
+                    _now(),
+                    record["signal_field"],
+                    record["confidence_level"],
+                    record["axis_stability_deg"],
+                    json.dumps(record["angle_convention"], ensure_ascii=True),
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    @staticmethod
+    def _source_dict(row: sqlite3.Row) -> dict:
+        d = dict(row)
+        d["excluded"] = bool(d["excluded"])
+        return d
+
+    def _fetch_sources(self, study_id: int) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM meridian_sources WHERE study_id = ? ORDER BY source_index",
+            (study_id,),
+        ).fetchall()
+        return [self._source_dict(r) for r in rows]
+
+    def add_study_source(self, study_id: int, src: dict) -> dict:
+        """追加一份冻结分析版本作为来源；source_index 递增，重复引用被拒绝。"""
+        with self._lock:
+            dup = self._conn.execute(
+                "SELECT 1 FROM meridian_sources"
+                " WHERE study_id = ? AND test_id = ? AND version_no = ?",
+                (study_id, src["test_id"], src["version_no"]),
+            ).fetchone()
+            if dup is not None:
+                raise ConflictError(
+                    f"分析版本（批次 {src['test_id']} v{src['version_no']}）"
+                    "已是本研究来源，不能重复追加"
+                )
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(source_index), -1) AS s FROM meridian_sources"
+                " WHERE study_id = ?",
+                (study_id,),
+            ).fetchone()
+            index = int(row["s"]) + 1
+            self._conn.execute(
+                """INSERT INTO meridian_sources
+                   (study_id, source_index, test_id, version_no,
+                    mirror_rotation_deg, knife_diameter_azimuth_deg,
+                    sampled_at, added_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    study_id,
+                    index,
+                    src["test_id"],
+                    src["version_no"],
+                    src["mirror_rotation_deg"],
+                    src["knife_diameter_azimuth_deg"],
+                    src.get("sampled_at"),
+                    _now(),
+                ),
+            )
+            self._conn.commit()
+            return self.get_study_source(study_id, index)
+
+    def get_study(self, study_id: int) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM meridian_studies WHERE id = ?", (study_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"子午线复测研究 {study_id} 不存在")
+            study = dict(row)
+            study["angle_convention"] = json.loads(study.pop("angle_convention_json"))
+            study["sources"] = self._fetch_sources(study_id)
+            study["versions"] = self.list_study_versions(study_id)
+            return study
+
+    def list_studies(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT s.id, s.name, s.notes, s.status, s.created_at,"
+                " s.finalized_at, s.signal_field, s.confidence_level,"
+                " COUNT(src.id) AS n_sources,"
+                " SUM(CASE WHEN src.excluded = 0 THEN 1 ELSE 0 END) AS n_active,"
+                " MAX(v.version_no) AS latest_version_no"
+                " FROM meridian_studies s"
+                " LEFT JOIN meridian_sources src ON src.study_id = s.id"
+                " LEFT JOIN meridian_versions v ON v.study_id = s.id"
+                " GROUP BY s.id ORDER BY s.id"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_study_source(self, study_id: int, source_index: int) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM meridian_sources"
+                " WHERE study_id = ? AND source_index = ?",
+                (study_id, source_index),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(
+                    f"研究 {study_id} 中没有来源 #{source_index}"
+                )
+            return self._source_dict(row)
+
+    def set_study_source_excluded(
+        self, study_id: int, source_index: int, reason: str
+    ) -> None:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE meridian_sources SET excluded = 1, exclude_reason = ?"
+                " WHERE study_id = ? AND source_index = ?",
+                (reason, study_id, source_index),
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError(
+                    f"研究 {study_id} 中没有来源 #{source_index}"
+                )
+            self._conn.commit()
+
+    def copy_study_sources(self, dst_study_id: int, sources: list[dict]) -> None:
+        """复制研究时把来源引用原样带入新档案（排除标记重置，原因清空）。"""
+        with self._lock:
+            for index, src in enumerate(sources):
+                self._conn.execute(
+                    """INSERT INTO meridian_sources
+                       (study_id, source_index, test_id, version_no,
+                        mirror_rotation_deg, knife_diameter_azimuth_deg,
+                        sampled_at, added_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        dst_study_id,
+                        index,
+                        src["test_id"],
+                        src["version_no"],
+                        src["mirror_rotation_deg"],
+                        src["knife_diameter_azimuth_deg"],
+                        src.get("sampled_at"),
+                        _now(),
+                    ),
+                )
+            self._conn.commit()
+
+    def create_study_version(
+        self,
+        study_id: int,
+        input_hash: str,
+        active_source_ids: list[int],
+        excluded_snapshot: list[dict],
+        result: dict,
+        loo: dict | None,
+    ) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(version_no), 0) AS v FROM meridian_versions"
+                " WHERE study_id = ?",
+                (study_id,),
+            ).fetchone()
+            version_no = int(row["v"]) + 1
+            self._conn.execute(
+                """INSERT INTO meridian_versions
+                   (study_id, version_no, created_at, input_hash,
+                    active_source_ids_json, excluded_snapshot_json,
+                    result_json, loo_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    study_id,
+                    version_no,
+                    _now(),
+                    input_hash,
+                    json.dumps(active_source_ids, ensure_ascii=True),
+                    json.dumps(excluded_snapshot, ensure_ascii=True),
+                    json.dumps(result, ensure_ascii=True),
+                    json.dumps(loo, ensure_ascii=True) if loo is not None else None,
+                ),
+            )
+            self._conn.commit()
+            return self.get_study_version(study_id, version_no)
+
+    def get_latest_study_version(self, study_id: int) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM meridian_versions WHERE study_id = ?"
+                " ORDER BY version_no DESC LIMIT 1",
+                (study_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"研究 {study_id} 尚无求解版本")
+            return self._study_version_dict(row)
+
+    def get_study_version(self, study_id: int, version_no: int) -> dict:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM meridian_versions"
+                " WHERE study_id = ? AND version_no = ?",
+                (study_id, version_no),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"研究 {study_id} 的版本 {version_no} 不存在")
+            return self._study_version_dict(row)
+
+    def list_study_versions(self, study_id: int) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, version_no, created_at, input_hash,"
+                " active_source_ids_json, result_json FROM meridian_versions"
+                " WHERE study_id = ? ORDER BY version_no",
+                (study_id,),
+            ).fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                d["active_source_ids"] = json.loads(d.pop("active_source_ids_json"))
+                result = json.loads(d.pop("result_json"))
+                d["summary"] = {
+                    "n_sources": result.get("n_sources"),
+                    "n_zones": result.get("n_zones"),
+                    "rank": result.get("rank"),
+                    "mirror_axis_deg": result.get("astigmatism", {})
+                    .get("mirror", {})
+                    .get("principal_axis_mirror_deg"),
+                    "mirror_rim_amplitude_nm": result.get("astigmatism", {})
+                    .get("mirror", {})
+                    .get("rim_wavefront_amplitude_nm"),
+                    "total_wavefront_rms_waves": result.get("astigmatism", {})
+                    .get("total_wavefront_rms_waves"),
+                    "most_suspicious_zone": (
+                        result.get("most_suspicious_zone", {}) or {}
+                    ).get("index"),
+                    "loo_stable": (result.get("loo") or {}).get("stable"),
+                }
+                out.append(d)
+            return out
+
+    @staticmethod
+    def _study_version_dict(row: sqlite3.Row) -> dict:
+        d = dict(row)
+        d["active_source_ids"] = json.loads(d.pop("active_source_ids_json"))
+        d["excluded_snapshot"] = json.loads(d.pop("excluded_snapshot_json"))
+        d["result"] = json.loads(d.pop("result_json"))
+        raw_loo = d.pop("loo_json")
+        d["loo"] = json.loads(raw_loo) if raw_loo else None
+        return d
+
+    def finalize_study(
+        self,
+        study_id: int,
+        input_hash: str,
+        freeze_json: str,
+        version_no: int,
+    ) -> dict:
+        """原子定稿：仅当研究仍开放时冻结。返回 finalized | reused | stale。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status, input_hash FROM meridian_studies WHERE id = ?",
+                (study_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"子午线复测研究 {study_id} 不存在")
+            if row["status"] == "finalized":
+                return {"status": "reused", "input_hash": row["input_hash"]}
+            cur = self._conn.execute(
+                "UPDATE meridian_studies SET status = 'finalized', finalized_at = ?,"
+                " input_hash = ?, freeze_json = ? WHERE id = ? AND status = 'open'",
+                (_now(), input_hash, freeze_json, study_id),
+            )
+            if cur.rowcount == 0:
+                return {"status": "stale", "input_hash": None}
+            self._conn.commit()
+            return {"status": "finalized", "input_hash": input_hash,
+                    "version_no": version_no}

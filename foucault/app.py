@@ -1,6 +1,8 @@
 """FastAPI 路由：测试批次管理、读数冻结/剔除、分析版本、批次对比、修正搜索、
 Couder 遮罩方案（版本化布局、边界搜索、1:1 SVG）、往返测量会话
-（逐笔采集、漂移/回程校正、定稿生成测试批次）。"""
+（逐笔采集、漂移/回程校正、定稿生成测试批次），以及子午线复测研究
+（4~16 份冻结分析版本的二次角向谐波拟合、镜面/架位像散分离、留一稳定性、
+定稿冻结与复制追加）。"""
 from __future__ import annotations
 
 import json
@@ -21,6 +23,13 @@ from .mask import (
     render_mask_svg,
     search_layouts,
     validate_constants as validate_mask_constants,
+)
+from .meridian import (
+    ANGLE_CONVENTION,
+    MeridianError,
+    extract_zone_signals,
+    fit_harmonics,
+    leave_one_out,
 )
 from .optics import (
     UNIT_TO_MM,
@@ -47,6 +56,12 @@ from .schemas import (
     SessionCreateIn,
     SessionExcludeIn,
     SessionLockIn,
+    StudyAppendIn,
+    StudyCopyIn,
+    StudyCreateIn,
+    StudyExcludeIn,
+    StudyFinalizeIn,
+    StudySolveIn,
     TestCreateIn,
 )
 from .session import (
@@ -293,8 +308,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
         version=__version__,
         description="将 Couder 遮罩分区读数还原为镜面/波前误差，支持版本化分析、"
         "读数冻结与剔除、批次对比、分区修正量搜索、Couder 遮罩方案设计"
-        "（版本化布局、边界搜索、1:1 SVG），以及上机往返测量会话"
-        "（逐笔校验、零点漂移/回程间隙校正、定稿冻结并生成测试批次）。",
+        "（版本化布局、边界搜索、1:1 SVG）、上机往返测量会话"
+        "（逐笔校验、零点漂移/回程间隙校正、定稿冻结并生成测试批次），"
+        "以及子午线复测研究（4~16 份冻结版本的二次角向谐波拟合、"
+        "镜面/架位像散分离、留一稳定性、定稿冻结与复制追加）。",
     )
 
     @app.exception_handler(NotFoundError)
@@ -318,6 +335,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return JSONResponse(
             status_code=422,
             content={"detail": {"message": "遮罩设计校验失败", "errors": exc.errors}},
+        )
+
+    @app.exception_handler(MeridianError)
+    async def _meridian_error(_, exc: MeridianError):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": {
+                    "message": str(exc),
+                    "errors": exc.gaps,
+                }
+            },
         )
 
     # ---------------- 测试批次 ----------------
@@ -1381,6 +1410,574 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return {
             "input_hash": session["input_hash"],
             "freeze": json.loads(session["freeze_json"]) if session.get("freeze_json") else None,
+        }
+
+    # ---------------- 子午线复测研究 ----------------
+    #
+    # 研究把同一面镜 4~16 份**冻结分析版本**组成独立档案，逐来源记录镜面
+    # 旋转角、刀口扫描直径方位与采样时间；来源引用（test_id+version_no）一旦
+    # 追加不改，排除只置标记（注明原因）不删行。每次求解写一条不可变研究
+    # 版本（输入哈希、参与来源、排除快照、二次谐波结果、留一报告）。定稿冻结
+    # 来源版本、角度约定、拟合参数与输入哈希，此后追加/排除/重解均被拒绝。
+
+    def _resolve_source_ref(s):
+        """来源引用 → (version, test, sampled_at ISO|None)；版本缺省取最新。"""
+        if s.version_no is not None:
+            v = db.get_version(s.test_id, s.version_no)
+        else:
+            v = db.get_latest_version(s.test_id)
+        test = db.get_test(s.test_id)
+        sampled_at = iso_dt(s.sampled_at) if s.sampled_at is not None else None
+        return v, test, sampled_at
+
+    def _check_source_consistency(resolved):
+        """resolved: [(version, test), ...]；校验口径/曲率半径/遮罩分区一致。"""
+        errs: list[str] = []
+        base_v, base_test = resolved[0]
+        base_zones = sorted(base_v["result"]["zones"], key=lambda z: z["index"])
+        for k, (v, test) in enumerate(resolved[1:], start=1):
+            label = f"来源 {k}（批次 {test['id']} v{v['version_no']}）"
+            if abs(test["diameter"] - base_test["diameter"]) > 1e-6:
+                errs.append(
+                    f"{label}：口径 {test['diameter']} mm 与首份来源 "
+                    f"{base_test['diameter']} mm 不一致"
+                )
+            if abs(test["radius_of_curvature"]
+                   - base_test["radius_of_curvature"]) > 1e-6:
+                errs.append(
+                    f"{label}：曲率半径 {test['radius_of_curvature']} mm 与首份来源 "
+                    f"{base_test['radius_of_curvature']} mm 不一致"
+                )
+            zones = sorted(v["result"]["zones"], key=lambda z: z["index"])
+            if len(zones) != len(base_zones):
+                errs.append(
+                    f"{label}：遮罩分区数 {len(zones)} 与首份来源 "
+                    f"{len(base_zones)} 不一致"
+                )
+                continue
+            for j, (z, bz) in enumerate(zip(zones, base_zones)):
+                if (
+                    abs(z["inner_radius"] - bz["inner_radius"]) > 1e-9
+                    or abs(z["outer_radius"] - bz["outer_radius"]) > 1e-9
+                    or abs(z["r_mean"] - bz["r_mean"]) > 1e-9
+                ):
+                    errs.append(
+                        f"{label}：分区 {j} 边界（{z['inner_radius']}~"
+                        f"{z['outer_radius']}）与首份来源（{bz['inner_radius']}~"
+                        f"{bz['outer_radius']}）不一致"
+                    )
+        return errs
+
+    def _study_detail(study: dict) -> dict:
+        return {
+            "id": study["id"],
+            "name": study["name"],
+            "notes": study["notes"],
+            "status": study["status"],
+            "created_at": study["created_at"],
+            "finalized_at": study.get("finalized_at"),
+            "signal_field": study["signal_field"],
+            "confidence_level": study["confidence_level"],
+            "axis_stability_deg": study["axis_stability_deg"],
+            "angle_convention": study["angle_convention"],
+            "input_hash": study.get("input_hash"),
+            "sources": [
+                {
+                    "id": s["id"],
+                    "source_index": s["source_index"],
+                    "test_id": s["test_id"],
+                    "version_no": s["version_no"],
+                    "mirror_rotation_deg": s["mirror_rotation_deg"],
+                    "knife_diameter_azimuth_deg": s["knife_diameter_azimuth_deg"],
+                    "sampled_at": s["sampled_at"],
+                    "excluded": s["excluded"],
+                    "exclude_reason": s["exclude_reason"],
+                }
+                for s in study["sources"]
+            ],
+            "versions": study["versions"],
+        }
+
+    def _gather_study_matrix(study: dict):
+        """有效来源 → (matrix, errors)；errors 非空时 matrix 为 None。"""
+        active = [s for s in study["sources"] if not s["excluded"]]
+        if len(active) < 4:
+            return None, [
+                f"有效来源仅 {len(active)} 份（排除后仍需 ≥4 份才能分离两类二次"
+                "像散），请追加来源后再求解"
+            ]
+        resolved = []
+        for s in active:
+            v = db.get_version(s["test_id"], s["version_no"])
+            test = db.get_test(s["test_id"])
+            resolved.append((v, test, s))
+        errs = _check_source_consistency([(v, t) for v, t, _ in resolved])
+        if errs:
+            return None, errs
+        base_v, base_test, _ = resolved[0]
+        base_zones = sorted(base_v["result"]["zones"], key=lambda z: z["index"])
+        radii = [z["r_mean"] for z in base_zones]
+        inner = [z["inner_radius"] for z in base_zones]
+        outer = [z["outer_radius"] for z in base_zones]
+        field = study["signal_field"]
+        psi, alpha, signals, source_signals = [], [], [], []
+        for v, _test, s in resolved:
+            sig = extract_zone_signals(v["result"], field)
+            psi.append(s["mirror_rotation_deg"])
+            alpha.append(s["knife_diameter_azimuth_deg"])
+            signals.append(sig)
+            source_signals.append(
+                {
+                    "test_id": s["test_id"],
+                    "version_no": s["version_no"],
+                    "source_input_hash": v["input_hash"],
+                    "mirror_rotation_deg": s["mirror_rotation_deg"],
+                    "knife_diameter_azimuth_deg": s["knife_diameter_azimuth_deg"],
+                    "signals_mm": sig,
+                }
+            )
+        matrix = {
+            "psi": psi,
+            "alpha": alpha,
+            "signals": signals,
+            "radii": radii,
+            "inner": inner,
+            "outer": outer,
+            "R": base_test["radius_of_curvature"],
+            "rim": base_test["diameter"] / 2.0,
+            "wavelength_nm": base_test["wavelength_nm"],
+            "diameter": base_test["diameter"],
+            "source_signals": source_signals,
+            "active": active,
+        }
+        return matrix, []
+
+    def _study_input_payload(study: dict, matrix: dict) -> dict:
+        """参与求解的有效输入（哈希只覆盖真正参与拟合的数据）。"""
+        return {
+            "signal_field": study["signal_field"],
+            "confidence_level": study["confidence_level"],
+            "axis_stability_deg": study["axis_stability_deg"],
+            "angle_convention": study["angle_convention"],
+            "constants": {
+                "diameter": matrix["diameter"],
+                "radius_of_curvature": matrix["R"],
+                "wavelength_nm": matrix["wavelength_nm"],
+            },
+            "zones": [
+                {"inner_radius": i, "outer_radius": o, "r_mean": r}
+                for i, o, r in zip(matrix["inner"], matrix["outer"], matrix["radii"])
+            ],
+            "sources": [
+                {
+                    "test_id": s["test_id"],
+                    "version_no": s["version_no"],
+                    "source_input_hash": s["source_input_hash"],
+                    "mirror_rotation_deg": s["mirror_rotation_deg"],
+                    "knife_diameter_azimuth_deg": s["knife_diameter_azimuth_deg"],
+                    "signals_mm": [round(x, 12) for x in s["signals_mm"]],
+                }
+                for s in matrix["source_signals"]
+            ],
+        }
+
+    def _require_open_study(study: dict) -> None:
+        if study["status"] == "finalized":
+            raise _err(
+                409,
+                f"研究 {study['id']} 已定稿冻结（输入哈希 {study['input_hash']}），"
+                "来源版本、角度约定、拟合参数与既有结果均不可改写；"
+                "如需追加新批次请先复制研究（/copy）",
+            )
+
+    def _study_version_brief(v: dict) -> dict:
+        r = v["result"]
+        return {
+            "study_id": v["study_id"],
+            "version_no": v["version_no"],
+            "created_at": v["created_at"],
+            "input_hash": v["input_hash"],
+            "reused": v.get("reused", False),
+            "summary": {
+                "n_sources": r["n_sources"],
+                "n_zones": r["n_zones"],
+                "rank": r["rank"],
+                "residual_dof": r["residual_dof"],
+                "residual_sigma_mm": r["residual_sigma_mm"],
+                "mirror_axis_deg": r["astigmatism"]["mirror"][
+                    "principal_axis_mirror_deg"
+                ],
+                "mirror_rim_amplitude_nm": r["astigmatism"]["mirror"][
+                    "rim_wavefront_amplitude_nm"
+                ],
+                "lab_axis_deg": r["astigmatism"]["lab_fixed"][
+                    "principal_axis_lab_deg"
+                ],
+                "lab_rim_amplitude_nm": r["astigmatism"]["lab_fixed"][
+                    "rim_wavefront_amplitude_nm"
+                ],
+                "total_wavefront_rms_waves": r["astigmatism"][
+                    "total_wavefront_rms_waves"
+                ],
+                "most_suspicious_zone": r["most_suspicious_zone"]["index"],
+                "loo_stable": (r.get("loo") or {}).get("stable"),
+            },
+        }
+
+    def _run_study_solve(study_id: int, include_loo: bool = True) -> dict:
+        """用当前有效来源求解；输入与最新版本一致时幂等复用。"""
+        study = db.get_study(study_id)
+        matrix, errs = _gather_study_matrix(study)
+        if errs:
+            raise _err(422, "子午线研究无法求解", errs)
+        input_hash = compute_input_hash(_study_input_payload(study, matrix))
+        try:
+            latest = db.get_latest_study_version(study_id)
+        except NotFoundError:
+            latest = None
+        if latest is not None and latest["input_hash"] == input_hash:
+            latest["reused"] = True
+            return latest
+        result = fit_harmonics(
+            matrix["psi"],
+            matrix["alpha"],
+            matrix["signals"],
+            matrix["radii"],
+            matrix["inner"],
+            matrix["outer"],
+            matrix["R"],
+            matrix["rim"],
+            matrix["wavelength_nm"],
+            confidence_level=study["confidence_level"],
+        )
+        loo = None
+        if include_loo:
+            loo = leave_one_out(
+                matrix["psi"],
+                matrix["alpha"],
+                matrix["signals"],
+                matrix["radii"],
+                matrix["inner"],
+                matrix["outer"],
+                matrix["R"],
+                matrix["rim"],
+                matrix["wavelength_nm"],
+                confidence_level=study["confidence_level"],
+                axis_stability_deg=study["axis_stability_deg"],
+            )
+            result["loo"] = loo
+        active_ids = [s["id"] for s in matrix["active"]]
+        excluded_snapshot = [
+            {
+                "source_index": s["source_index"],
+                "test_id": s["test_id"],
+                "version_no": s["version_no"],
+                "reason": s["exclude_reason"],
+            }
+            for s in study["sources"]
+            if s["excluded"]
+        ]
+        version = db.create_study_version(
+            study_id, input_hash, active_ids, excluded_snapshot, result, loo
+        )
+        version["reused"] = False
+        return version
+
+    def _append_sources(study_id: int, sources) -> list[tuple]:
+        """校验并追加来源；返回解析出的 (version,test,s,sampled_at)。"""
+        study = db.get_study(study_id)
+        _require_open_study(study)
+        seen = set()
+        resolved = []
+        for k, s in enumerate(sources):
+            v, test, sampled_at = _resolve_source_ref(s)
+            key = (test["id"], v["version_no"])
+            if key in seen:
+                raise _err(
+                    422,
+                    f"来源 {k}：批次 {test['id']} v{v['version_no']} 在请求中重复",
+                )
+            seen.add(key)
+            resolved.append((v, test, s, sampled_at))
+        existing = {(src["test_id"], src["version_no"]) for src in study["sources"]}
+        dups = [
+            f"批次 {t['id']} v{v['version_no']} 已是研究来源"
+            for v, t, _s, _sa in resolved
+            if (t["id"], v["version_no"]) in existing
+        ]
+        if dups:
+            raise _err(409, "不能重复追加同一冻结分析版本", dups)
+        projected = len(study["sources"]) + len(resolved)
+        if projected > 16:
+            raise _err(
+                422,
+                f"追加后来源总数 {projected} 超过研究档案上限 16"
+                "（每份来源为一个冻结分析版本）",
+            )
+        # 口径/曲率半径/遮罩分区一致性：新来源须与既有来源一致（先校验再落库）
+        all_refs = [(db.get_version(s["test_id"], s["version_no"]),
+                     db.get_test(s["test_id"])) for s in study["sources"]]
+        all_refs += [(v, t) for v, t, _s, _sa in resolved]
+        consistency = _check_source_consistency(all_refs)
+        if consistency:
+            raise _err(
+                422, "子午线研究来源不一致（口径/曲率半径/遮罩分区必须相同）",
+                consistency,
+            )
+        for v, _test, s, sampled_at in resolved:
+            db.add_study_source(
+                study_id,
+                {
+                    "test_id": v["test_id"],
+                    "version_no": v["version_no"],
+                    "mirror_rotation_deg": s.mirror_rotation_deg,
+                    "knife_diameter_azimuth_deg": s.knife_diameter_azimuth_deg,
+                    "sampled_at": sampled_at,
+                },
+            )
+        return resolved
+
+    @app.post("/api/meridian-studies", status_code=201)
+    def create_study(payload: StudyCreateIn):
+        # 解析 + 一致性/重复校验先于落库（失败不留档案）
+        seen = set()
+        resolved = []
+        for k, s in enumerate(payload.sources):
+            v, test, sampled_at = _resolve_source_ref(s)
+            key = (test["id"], v["version_no"])
+            if key in seen:
+                raise _err(
+                    422,
+                    f"来源 {k}：批次 {test['id']} v{v['version_no']} 在请求中重复",
+                )
+            seen.add(key)
+            resolved.append((v, test, s, sampled_at))
+        errs = _check_source_consistency([(v, t) for v, t, _s, _sa in resolved])
+        if errs:
+            raise _err(
+                422, "子午线研究来源不一致（口径/曲率半径/遮罩分区必须相同）", errs
+            )
+        study_id = db.create_study(
+            {
+                "name": payload.name,
+                "notes": payload.notes,
+                "signal_field": payload.signal_field,
+                "confidence_level": payload.confidence_level,
+                "axis_stability_deg": payload.axis_stability_deg,
+                "angle_convention": ANGLE_CONVENTION,
+            }
+        )
+        for v, _test, s, sampled_at in resolved:
+            db.add_study_source(
+                study_id,
+                {
+                    "test_id": v["test_id"],
+                    "version_no": v["version_no"],
+                    "mirror_rotation_deg": s.mirror_rotation_deg,
+                    "knife_diameter_azimuth_deg": s.knife_diameter_azimuth_deg,
+                    "sampled_at": sampled_at,
+                },
+            )
+        study = db.get_study(study_id)
+        # 首次求解欠秩：档案保留（待补角度），以 422 返回角度缺口
+        try:
+            version = _run_study_solve(study_id, include_loo=payload.loo)
+        except MeridianError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "study": _study_detail(study),
+                    "solve_error": {"message": str(exc), "errors": exc.gaps},
+                },
+            )
+        return {"study": _study_detail(study), "version": _study_version_brief(version)}
+
+    @app.get("/api/meridian-studies")
+    def list_studies():
+        return {"studies": db.list_studies()}
+
+    @app.get("/api/meridian-studies/{study_id}")
+    def get_study(study_id: int):
+        return {"study": _study_detail(db.get_study(study_id))}
+
+    @app.post("/api/meridian-studies/{study_id}/sources", status_code=201)
+    def append_study_sources(study_id: int, payload: StudyAppendIn):
+        _append_sources(study_id, payload.sources)
+        study = db.get_study(study_id)
+        out = {"study": _study_detail(study)}
+        if payload.solve:
+            out["version"] = _study_version_brief(_run_study_solve(study_id))
+        return out
+
+    @app.post("/api/meridian-studies/{study_id}/sources/exclude")
+    def exclude_study_source(study_id: int, payload: StudyExcludeIn):
+        study = db.get_study(study_id)
+        _require_open_study(study)
+        src = db.get_study_source(study_id, payload.source_index)
+        if src["excluded"]:
+            raise _err(
+                409,
+                f"来源 #{payload.source_index} 已被排除"
+                f"（原因：{src['exclude_reason']}）",
+            )
+        active_now = sum(1 for s in study["sources"] if not s["excluded"]) - 1
+        if active_now < 4:
+            raise _err(
+                409,
+                f"排除后有效来源仅 {active_now} 份，少于分离两类二次像散所需的 4 份",
+            )
+        db.set_study_source_excluded(study_id, payload.source_index, payload.reason)
+        study = db.get_study(study_id)
+        out = {
+            "study": _study_detail(study),
+            "excluded": {"source_index": payload.source_index, "reason": payload.reason},
+        }
+        if payload.solve:
+            out["version"] = _study_version_brief(
+                _run_study_solve(study_id, include_loo=payload.loo)
+            )
+        return out
+
+    @app.post("/api/meridian-studies/{study_id}/solve", status_code=201)
+    def solve_study(study_id: int, payload: StudySolveIn):
+        study = db.get_study(study_id)
+        _require_open_study(study)
+        return {
+            "version": _study_version_brief(
+                _run_study_solve(study_id, include_loo=payload.loo)
+            )
+        }
+
+    @app.get("/api/meridian-studies/{study_id}/loo")
+    def study_loo(study_id: int, version_no: int | None = None):
+        study = db.get_study(study_id)
+        v = (
+            db.get_study_version(study_id, version_no)
+            if version_no is not None
+            else db.get_latest_study_version(study_id)
+        )
+        if v["loo"] is None:
+            matrix, errs = _gather_study_matrix(study)
+            if errs:
+                raise _err(422, "子午线研究无法计算留一法", errs)
+            loo = leave_one_out(
+                matrix["psi"],
+                matrix["alpha"],
+                matrix["signals"],
+                matrix["radii"],
+                matrix["inner"],
+                matrix["outer"],
+                matrix["R"],
+                matrix["rim"],
+                matrix["wavelength_nm"],
+                confidence_level=study["confidence_level"],
+                axis_stability_deg=study["axis_stability_deg"],
+            )
+            return {
+                "study_id": study_id,
+                "version_no": v["version_no"],
+                "computed_on_demand": True,
+                "loo": loo,
+            }
+        return {"study_id": study_id, "version_no": v["version_no"], "loo": v["loo"]}
+
+    @app.get("/api/meridian-studies/{study_id}/versions/{version_no}")
+    def get_study_version(study_id: int, version_no: int):
+        return db.get_study_version(study_id, version_no)
+
+    @app.post("/api/meridian-studies/{study_id}/copy", status_code=201)
+    def copy_study(study_id: int, payload: StudyCopyIn):
+        src_study = db.get_study(study_id)
+        base_name = src_study["name"] or f"研究 {study_id}"
+        new_id = db.create_study(
+            {
+                "name": payload.name or f"{base_name}（副本）",
+                "notes": payload.notes,
+                "signal_field": src_study["signal_field"],
+                "confidence_level": src_study["confidence_level"],
+                "axis_stability_deg": src_study["axis_stability_deg"],
+                "angle_convention": src_study["angle_convention"],
+            }
+        )
+        db.copy_study_sources(new_id, src_study["sources"])
+        new_study = db.get_study(new_id)
+        version = _run_study_solve(new_id)
+        return {
+            "study": _study_detail(new_study),
+            "copied_from_study_id": study_id,
+            "version": _study_version_brief(version),
+        }
+
+    @app.post("/api/meridian-studies/{study_id}/finalize")
+    def finalize_study(study_id: int, payload: StudyFinalizeIn):
+        study = db.get_study(study_id)
+        if study["status"] == "finalized":
+            return {
+                "study": _study_detail(study),
+                "reused": True,
+                "input_hash": study["input_hash"],
+            }
+        _require_open_study(study)
+        v = (
+            db.get_study_version(study_id, payload.version_no)
+            if payload.version_no is not None
+            else db.get_latest_study_version(study_id)
+        )
+        sources = []
+        for s in study["sources"]:
+            sv = db.get_version(s["test_id"], s["version_no"])
+            sources.append(
+                {
+                    "source_index": s["source_index"],
+                    "test_id": s["test_id"],
+                    "version_no": s["version_no"],
+                    "version_input_hash": sv["input_hash"],
+                    "mirror_rotation_deg": s["mirror_rotation_deg"],
+                    "knife_diameter_azimuth_deg": s["knife_diameter_azimuth_deg"],
+                    "sampled_at": s["sampled_at"],
+                    "excluded": bool(s["excluded"]),
+                    "exclude_reason": s["exclude_reason"],
+                }
+            )
+        freeze = {
+            "study_id": study_id,
+            "frozen_version_no": v["version_no"],
+            "sources": sources,
+            "angle_convention": study["angle_convention"],
+            "fit_params": {
+                "signal_field": study["signal_field"],
+                "confidence_level": study["confidence_level"],
+                "axis_stability_deg": study["axis_stability_deg"],
+            },
+            "solve_input_hash": v["input_hash"],
+        }
+        freeze_str = json.dumps(freeze, sort_keys=True, ensure_ascii=True)
+        input_hash = compute_input_hash(freeze)
+        outcome = db.finalize_study(study_id, input_hash, freeze_str, v["version_no"])
+        if outcome["status"] != "finalized":
+            settled = db.get_study(study_id)
+            return {
+                "study": _study_detail(settled),
+                "reused": True,
+                "input_hash": outcome.get("input_hash"),
+            }
+        return {
+            "study": _study_detail(db.get_study(study_id)),
+            "reused": False,
+            "version_no": v["version_no"],
+            "input_hash": input_hash,
+        }
+
+    @app.get("/api/meridian-studies/{study_id}/freeze")
+    def get_study_freeze(study_id: int):
+        study = db.get_study(study_id)
+        if study["status"] != "finalized":
+            raise _err(409, f"研究 {study_id} 尚未定稿，无冻结包")
+        return {
+            "input_hash": study["input_hash"],
+            "freeze": json.loads(study["freeze_json"])
+            if study.get("freeze_json")
+            else None,
         }
 
     @app.get("/api/health")
