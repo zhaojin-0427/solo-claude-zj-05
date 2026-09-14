@@ -12,6 +12,11 @@ c_i (nm，正值 = 去除玻璃)，使修正后的残余波前误差最小。约
 差分算子（修正量的平滑性）。对一组平滑权重 λ 各解一个盒约束 QP
 （投影梯度 + FISTA 加速），连同直接截断基线一起，按
 (剩余波前 RMS, 修正平滑度, 材料去除量) 升序排序输出候选方案。
+
+若提供逐轮抽样的分区残余样本（mc_zone_residuals_nm，来自版本冻结的不
+确定度模型）与置信分位 confidence_quantile，则每个候选改用该分位下的
+残余波前 RMS 作为首要排序指标（优先降低该分位下的残余波前，再比较
+平滑度与磨除量）；同一种子下重复计算结果一致。
 """
 from __future__ import annotations
 
@@ -136,14 +141,27 @@ def search_corrections(
     max_mean_removal_nm: float | None = None,
     smoothing_weights: list[float] | None = None,
     refit_defocus: bool = True,
+    mc_zone_residuals_nm: list[list[float]] | None = None,
+    confidence_quantile: float | None = None,
 ) -> dict:
-    """搜索分区修正量并返回排序后的候选方案。"""
+    """搜索分区修正量并返回排序后的候选方案。
+
+    mc_zone_residuals_nm 为不确定度传播逐轮抽样的分区残余面形误差
+    （形状 n_rounds × n_zones，nm）；与 confidence_quantile 同时提供时，
+    候选按该置信分位下的残余波前 RMS 优先排序。
+    """
     e = np.asarray(residual_surface_nm, dtype=float)
     n = e.size
     if n < 2:
         raise CorrectionError("至少需要两个分区才能搜索修正量")
     if max_removal_nm <= 0:
         raise CorrectionError("最大磨除量必须为正数")
+    if (mc_zone_residuals_nm is None) != (confidence_quantile is None):
+        raise CorrectionError(
+            "按置信分位评估需同时提供逐轮分区残余样本与 confidence_quantile"
+        )
+    if confidence_quantile is not None and not 0.0 < confidence_quantile < 1.0:
+        raise CorrectionError("confidence_quantile 必须在 (0, 1) 区间内")
     r_m = np.asarray(r_mean, dtype=float)
     rim = diameter / 2.0
     areas = math.pi * (np.asarray(outer) ** 2 - np.asarray(inner) ** 2)
@@ -204,17 +222,45 @@ def search_corrections(
                 "metrics": metrics,
             }
         )
-    ranked.sort(
-        key=lambda item: (
-            item["metrics"]["residual_wavefront_rms_waves"],
-            item["metrics"]["smoothness_nm"],
-            item["metrics"]["removal_volume_mm3"],
+    if confidence_quantile is not None:
+        # 按指定置信分位评估：逐轮残余 (E - c) 投影后取面积加权 RMS，
+        # 跨轮取分位数作为首要排序指标（再比较平滑度与磨除量）
+        E = np.asarray(mc_zone_residuals_nm, dtype=float)
+        if E.ndim != 2 or E.shape[0] < 1 or E.shape[1] != n:
+            raise CorrectionError(
+                "逐轮分区残余样本形状与分区数不一致"
+                f"（期望 n_rounds × {n}，得到 {list(E.shape)}）"
+            )
+        w = areas / areas.sum()
+        for item in ranked:
+            c = np.asarray(item["corrections_nm"], dtype=float)
+            resid = (E - c) @ M  # M 对称幂等；每行一轮的拟合后残余
+            m = resid @ w
+            rms = np.sqrt(((resid - m[:, None]) ** 2) @ w)
+            q_nm = float(np.percentile(2.0 * rms, confidence_quantile * 100.0))
+            item["metrics"]["residual_wavefront_rms_nm_at_quantile"] = q_nm
+            item["metrics"]["residual_wavefront_rms_waves_at_quantile"] = (
+                q_nm / wavelength_nm
+            )
+        ranked.sort(
+            key=lambda item: (
+                item["metrics"]["residual_wavefront_rms_nm_at_quantile"],
+                item["metrics"]["smoothness_nm"],
+                item["metrics"]["removal_volume_mm3"],
+            )
         )
-    )
+    else:
+        ranked.sort(
+            key=lambda item: (
+                item["metrics"]["residual_wavefront_rms_waves"],
+                item["metrics"]["smoothness_nm"],
+                item["metrics"]["removal_volume_mm3"],
+            )
+        )
     for rank, item in enumerate(ranked):
         item["rank"] = rank
 
-    return {
+    out = {
         "constraints": {
             "max_removal_nm": float(max_removal_nm),
             "edge_zone_max_removal_nm": (
@@ -229,3 +275,6 @@ def search_corrections(
         "zone_upper_bounds_nm": [float(v) for v in ub],
         "candidates": ranked,
     }
+    if confidence_quantile is not None:
+        out["confidence_quantile"] = float(confidence_quantile)
+    return out

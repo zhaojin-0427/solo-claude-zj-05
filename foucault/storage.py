@@ -171,11 +171,13 @@ CREATE TABLE IF NOT EXISTS meridian_versions (
 );
 """
 
-# tests 表后加列（老库迁移）：批次引用的遮罩方案与版本
+# tests 表后加列（老库迁移）：批次引用的遮罩方案与版本、不确定度配置
 _TEST_EXTRA_COLUMNS = {
     "mask_scheme_id": "ALTER TABLE tests ADD COLUMN mask_scheme_id INTEGER",
     "mask_version_no": "ALTER TABLE tests ADD COLUMN mask_version_no INTEGER",
     "session_id": "ALTER TABLE tests ADD COLUMN session_id INTEGER",
+    # 不确定度传播配置（声明单位，JSON）；NULL 表示该批次不做不确定度传播
+    "uncertainty_json": "ALTER TABLE tests ADD COLUMN uncertainty_json TEXT",
 }
 
 # measurement_sessions 表后加列（老库迁移）
@@ -239,6 +241,8 @@ class Database:
 
         record 可带 mask_scheme_id / mask_version_no：批次冻结所引用遮罩
         版本的 ID，环带边界已在 zones 中复制，此后遮罩变更不影响本批次。
+        record 可带 uncertainty（声明单位配置 dict）：随批次冻结，作为
+        后续 analyze 的缺省不确定度配置；缺省 None 表示不做传播。
         """
         with self._lock:
             cur = self._conn.execute(
@@ -246,8 +250,8 @@ class Database:
                    (name, notes, created_at, unit, source_mode, diameter,
                     radius_of_curvature, conic_constant, wavelength_nm,
                     instrument_offset, options_json, mask_scheme_id,
-                    mask_version_no, session_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    mask_version_no, session_id, uncertainty_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record.get("name"),
                     record.get("notes"),
@@ -263,6 +267,11 @@ class Database:
                     record.get("mask_scheme_id"),
                     record.get("mask_version_no"),
                     record.get("session_id"),
+                    (
+                        json.dumps(record["uncertainty"], ensure_ascii=True)
+                        if record.get("uncertainty") is not None
+                        else None
+                    ),
                 ),
             )
             test_id = cur.lastrowid
@@ -293,6 +302,10 @@ class Database:
                 raise NotFoundError(f"测试批次 {test_id} 不存在")
             test = dict(row)
             test["options"] = json.loads(test.pop("options_json"))
+            # 未提交不确定度配置的批次不暴露该键，保持原响应形状
+            raw_unc = test.pop("uncertainty_json")
+            if raw_unc is not None:
+                test["uncertainty"] = json.loads(raw_unc)
             zones = self._conn.execute(
                 "SELECT * FROM zones WHERE test_id = ? ORDER BY zone_index", (test_id,)
             ).fetchall()

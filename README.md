@@ -37,15 +37,15 @@ python3 run.py                 # 或 uvicorn foucault.app:app
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/api/tests` | 创建测试批次并自动生成分析版本 v1（可直接给分区，或引用遮罩版本） |
+| POST | `/api/tests` | 创建测试批次并自动生成分析版本 v1（可直接给分区，或引用遮罩版本；可附 `uncertainty` 不确定度配置） |
 | GET | `/api/tests` / `/api/tests/{id}` | 批次列表 / 详情（含读数状态） |
 | POST | `/api/tests/{id}/readings/exclude` | 带原因剔除读数（可自动重分析） |
 | POST | `/api/tests/{id}/readings/restore` | 恢复被剔除读数 |
 | POST | `/api/tests/{id}/readings/freeze` | 冻结可信读数（冻结后不可剔除） |
-| POST | `/api/tests/{id}/analyze` | 用当前有效读数（可换算法选项）生成新版本 |
+| POST | `/api/tests/{id}/analyze` | 用当前有效读数（可换算法选项 / 不确定度配置）生成新版本 |
 | GET | `/api/tests/{id}/versions[/n]` | 版本列表 / 版本完整结果 |
 | POST | `/api/compare` | 对比多个测试批次（遮罩一致时给出逐区差值） |
-| POST | `/api/tests/{id}/corrections/search` | 约束下搜索分区修正量并排序 |
+| POST | `/api/tests/{id}/corrections/search` | 约束下搜索分区修正量并排序（可按置信分位评估候选） |
 | POST | `/api/mask-schemes` | 创建遮罩方案并生成版本 v1（常量与制作限制冻结） |
 | GET | `/api/mask-schemes` / `/api/mask-schemes/{id}` | 方案列表 / 详情（含版本列表） |
 | POST | `/api/mask-schemes/{id}/versions` | 新参数生成新版本（参数相同则幂等复用） |
@@ -206,6 +206,44 @@ attempt），或当前应采测次（漏测后补在计划位置）；对其他�
 每个版本冻结：全部原始读数（含被剔除者及其原因）、常量、算法选项与输入
 哈希（SHA-256，只覆盖真正参与分析的数据）。输入未变时重复 `analyze` 幂等
 复用最新版本；重复读取同一版本结果不变。
+
+### 不确定度传播（Monte Carlo）
+
+创建批次或重新分析时可附 `uncertainty` 配置，为分区分析补上可追溯的不确定度：
+
+- `diameter_std` / `radius_of_curvature_std` / `instrument_offset_std`：口径、
+  曲率半径、仪器零位的标准不确定度（按批次 `unit` 提交，内部换算 mm）；
+  `wavelength_std_nm`：检测波长标准不确定度（nm）。各分量必须为非负有限
+  数值，0 表示该分量不参与抽样
+- `knife_resolution`：刀口尺分辨率（缺省时回退到批次引用遮罩版本的冻结值，
+  无遮罩则为 0）；每条读数每轮叠加 ±分辨率/2 的均匀量化误差
+- `repeatability_mode`：分区重复性。`estimated` 由各区有效重复读数估计
+  标准差（n<2 为 0）；`specified` 按 `zone_repeatability` 逐区指定
+  （长度必须等于分区数）
+- `n_samples`：抽样轮数 500~20000（默认 1000；计算量随轮数 × 非零分量
+  分组数增长）；`seed`：随机种子，缺省时由输入哈希派生
+
+Python 每轮**共同抽样常量与零位**（四个独立正态扰动），按分辨率加入均匀
+量化误差并逐条抽样分区读数，再复用同一套光学还原（`reduce_test`）。结果
+随分析版本冻结（模型 mm 规范值、种子、逐区重复性与全部统计量），给出：
+
+- 最佳拟合圆锥常数、RMS/PV 波前（nm 与波长数）、Strehl 的
+  **P5/P50/P95**（附 mean/std）
+- 各区**越过误差带的概率**（逐轮判定 `out_of_band` 的频率）
+- **方差贡献**：逐项固定输入分组（口径/曲率半径/波长/零位/量化/重复性）
+  用公共随机数重算，贡献 = (Var_full − Var_{−g}) / Var_full，对波前
+  RMS(nm) 与 Strehl 两个输出分别给出（波长等分量只影响后者）；零不确定度
+  分组直接为 0 不重复抽样。仪器零位为共模扰动，被零点参考吸收，贡献恒为 0
+
+不确定度配置进入版本输入哈希：配置不同则产生新版本，相同输入重复计算
+（含种子派生）结果完全一致；**未提交配置的旧请求保持原响应**（版本、
+批次详情中不出现 `uncertainty` 键）。
+
+修正量搜索附 `confidence_quantile`（如 0.95）时，用该版本冻结的不确定度
+模型与种子重新传播逐轮分区残余，按**该置信分位下的残余波前 RMS** 作为
+首要排序指标（再比较平滑度与磨除量），候选指标附带
+`residual_wavefront_rms_nm_at_quantile`；版本无不确定度模型时 422。
+相同版本重复计算结果一致；不指定分位时响应与原有完全一致。
 
 ### 修正量搜索
 

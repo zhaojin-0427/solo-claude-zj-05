@@ -6,10 +6,11 @@
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 Unit = Literal["mm", "in"]
 SourceMode = Literal["fixed", "moving"]
@@ -30,6 +31,57 @@ class AnalysisOptionsIn(BaseModel):
     fit_conic: bool = True
     fit_defocus: bool = True
     reference: Literal["innermost", "mean"] = "innermost"
+
+
+class UncertaintyConfigIn(BaseModel):
+    """分区分析的不确定度传播配置（长度量按批次 unit 提交，内部换算 mm）。
+
+    - 各标准不确定度分量为非负有限数值；0 表示该分量不参与抽样；
+    - knife_resolution（刀口尺分辨率）缺省时：批次引用遮罩版本则取其冻结值，
+      否则为 0（不加入量化误差）；
+    - repeatability_mode=estimated：逐区由有效重复读数估计标准差（n<2 为 0）；
+      specified：按 zone_repeatability 逐区指定（长度必须等于分区数）；
+    - n_samples 为 Monte Carlo 抽样轮数（500~20000）；seed 缺省时由输入哈希
+      派生，随分析版本冻结，相同输入重复计算结果完全一致。
+    """
+
+    n_samples: int = Field(default=1000, ge=500, le=20000)
+    seed: int | None = Field(default=None, ge=0, le=2147483647)
+    diameter_std: float = Field(default=0.0, ge=0.0)
+    radius_of_curvature_std: float = Field(default=0.0, ge=0.0)
+    wavelength_std_nm: float = Field(default=0.0, ge=0.0)
+    instrument_offset_std: float = Field(default=0.0, ge=0.0)
+    knife_resolution: float | None = Field(default=None, ge=0.0)
+    repeatability_mode: Literal["estimated", "specified"] = "estimated"
+    zone_repeatability: list[float] | None = None
+
+    @model_validator(mode="after")
+    def _check_components(self):
+        for name in (
+            "diameter_std",
+            "radius_of_curvature_std",
+            "wavelength_std_nm",
+            "instrument_offset_std",
+            "knife_resolution",
+        ):
+            v = getattr(self, name)
+            if v is not None and not math.isfinite(v):
+                raise ValueError(f"{name} 必须是有限数值")
+        if self.repeatability_mode == "specified":
+            if self.zone_repeatability is None:
+                raise ValueError(
+                    "repeatability_mode=specified 时必须提供 zone_repeatability"
+                )
+        elif self.zone_repeatability is not None:
+            raise ValueError(
+                "repeatability_mode=estimated 时不应提供 zone_repeatability"
+                "（将由重复读数估计）"
+            )
+        if self.zone_repeatability is not None and any(
+            (not math.isfinite(v)) or v < 0.0 for v in self.zone_repeatability
+        ):
+            raise ValueError("zone_repeatability 各分量必须为非负有限数值")
+        return self
 
 
 class TestCreateIn(BaseModel):
@@ -54,6 +106,7 @@ class TestCreateIn(BaseModel):
     mask_version_no: int | None = None  # 缺省取该方案最新版本
     zone_readings: list[list[float]] | None = None  # 引用遮罩时必填
     options: AnalysisOptionsIn = Field(default_factory=AnalysisOptionsIn)
+    uncertainty: UncertaintyConfigIn | None = None  # 缺省不做不确定度传播
 
 
 class ExcludeItem(BaseModel):
@@ -78,6 +131,7 @@ class FreezeIn(BaseModel):
 
 class AnalyzeIn(BaseModel):
     options: AnalysisOptionsIn | None = None  # 缺省沿用创建时的算法选项
+    uncertainty: UncertaintyConfigIn | None = None  # 缺省沿用创建时的不确定度配置
 
 
 class CompareEntry(BaseModel):
@@ -97,6 +151,8 @@ class CorrectionSearchIn(BaseModel):
     max_mean_removal_nm: float | None = Field(default=None, gt=0)
     smoothing_weights: list[float] | None = None
     refit_defocus: bool = True
+    # 指定后用版本冻结的不确定度模型按该置信分位评估候选残余波前
+    confidence_quantile: float | None = Field(default=None, gt=0.0, lt=1.0)
 
 
 class MaskParamsIn(BaseModel):

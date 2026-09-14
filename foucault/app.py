@@ -1,8 +1,9 @@
 """FastAPI 路由：测试批次管理、读数冻结/剔除、分析版本、批次对比、修正搜索、
 Couder 遮罩方案（版本化布局、边界搜索、1:1 SVG）、往返测量会话
-（逐笔采集、漂移/回程校正、定稿生成测试批次），以及子午线复测研究
+（逐笔采集、漂移/回程校正、定稿生成测试批次）、子午线复测研究
 （4~16 份冻结分析版本的二次角向谐波拟合、镜面/架位像散分离、留一稳定性、
-定稿冻结与复制追加）。"""
+定稿冻结与复制追加），以及分区分析的不确定度传播（Monte Carlo：
+常量/零位共同抽样、刀口尺量化误差、分区重复性，模型与种子随版本冻结）。"""
 from __future__ import annotations
 
 import json
@@ -12,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import __version__
@@ -64,6 +67,7 @@ from .schemas import (
     StudyFinalizeIn,
     StudySolveIn,
     TestCreateIn,
+    UncertaintyConfigIn,
 )
 from .session import (
     SessionError,
@@ -72,6 +76,13 @@ from .session import (
     iso as iso_dt,
 )
 from .storage import ConflictError, Database, NotFoundError
+from .uncertainty import (
+    UncertaintyError,
+    derive_seed,
+    resolve_model,
+    run_uncertainty,
+    sample_zone_residuals,
+)
 
 DEFAULT_DB = os.environ.get("FOUCAULT_DB", "foucault.db")
 
@@ -104,6 +115,21 @@ def _err(status: int, message: str, details: list | None = None) -> HTTPExceptio
         status_code=status,
         detail={"message": message, "errors": details or []},
     )
+
+
+def _json_safe(value):
+    """递归替换非有限浮点：inf/nan 不是合法 JSON，序列化前替换为字符串。
+
+    请求体携带 Infinity/NaN（Python json 可解析的非标准 JSON）时，校验错误
+    响应会回显原始输入；不替换则响应本身无法序列化（500 代替 422）。
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 def _validate_constants(
@@ -254,8 +280,10 @@ def _hash_payload(snapshot: dict) -> dict:
 
     剔除原因、冻结标记等元数据不改变分析输入，不进哈希；
     剔除/恢复改变有效读数集合，会改变哈希从而产生新版本。
+    不确定度配置（mm 冻结模型，种子未派生前）参与哈希：配置不同则
+    版本不同；未提交配置的旧请求不引入该键，哈希与原有一致。
     """
-    return {
+    payload = {
         "constants": snapshot["constants"],
         "options": snapshot["options"],
         "zones": [
@@ -269,14 +297,58 @@ def _hash_payload(snapshot: dict) -> dict:
             for z in snapshot["zones"]
         ],
     }
+    if snapshot.get("uncertainty") is not None:
+        payload["uncertainty"] = snapshot["uncertainty"]
+    return payload
 
 
-def _run_analysis(db: Database, test_id: int, options_dict: dict | None = None) -> dict:
-    """执行分析并写入新版本；输入与最新版本一致时复用该版本（幂等）。"""
+def _validate_uncertainty_config(
+    unc: UncertaintyConfigIn | None, n_zones: int
+) -> list[str]:
+    """不确定度配置的业务校验（类型/范围由 Pydantic 拦截）。"""
+    if unc is None:
+        return []
+    errs: list[str] = []
+    if unc.repeatability_mode == "specified":
+        vals = unc.zone_repeatability or []
+        if len(vals) != n_zones:
+            errs.append(
+                f"zone_repeatability 数量 {len(vals)} 与分区数 {n_zones} 不一致"
+            )
+    return errs
+
+
+def _resolve_uncertainty_model(
+    db: Database, test: dict, unc: dict, zones: list[ZoneInput]
+) -> dict:
+    """请求配置（声明单位）→ 冻结模型（mm）；刀口尺分辨率缺省时回退遮罩冻结值。"""
+    mask_kr = None
+    if test.get("mask_scheme_id") is not None:
+        mv = db.get_mask_version(test["mask_scheme_id"], test["mask_version_no"])
+        mask_kr = mv["params"]["knife_resolution"]
+    return resolve_model(unc, UNIT_TO_MM[test["unit"]], zones, mask_kr)
+
+
+def _run_analysis(
+    db: Database,
+    test_id: int,
+    options_dict: dict | None = None,
+    uncertainty_dict: dict | None = None,
+) -> dict:
+    """执行分析并写入新版本；输入与最新版本一致时复用该版本（幂等）。
+
+    不确定度配置缺省沿用批次创建时的配置；配置存在时把冻结模型
+    （mm、含派生种子）写入快照与结果，并随版本冻结 Monte Carlo 结果。
+    """
     test = db.get_test(test_id)
     opts = options_dict if options_dict is not None else test["options"]
+    unc = uncertainty_dict if uncertainty_dict is not None else test.get("uncertainty")
     zones = _collect_valid_zones(test)
     snapshot = _build_snapshot(test, opts)
+    model = None
+    if unc is not None:
+        model = _resolve_uncertainty_model(db, test, unc, zones)
+        snapshot["uncertainty"] = model
     input_hash = compute_input_hash(_hash_payload(snapshot))
     try:
         latest = db.get_latest_version(test_id)
@@ -286,13 +358,22 @@ def _run_analysis(db: Database, test_id: int, options_dict: dict | None = None) 
         latest["reused"] = True
         return latest
     result = reduce_test(_constants_of(test), zones, _options_of(opts))
+    if model is not None:
+        # 种子随版本冻结：请求未给种子时由输入哈希派生，重复计算一致
+        seed = model["seed"] if model["seed"] is not None else derive_seed(input_hash)
+        model = {**model, "seed": seed}
+        snapshot["uncertainty"] = model
+        result["uncertainty"] = {
+            "model": model,
+            **run_uncertainty(_constants_of(test), zones, _options_of(opts), model),
+        }
     version = db.create_version(test_id, input_hash, snapshot, result)
     version["reused"] = False
     return version
 
 
 def _version_brief(v: dict) -> dict:
-    return {
+    brief = {
         "test_id": v["test_id"],
         "version_no": v["version_no"],
         "created_at": v["created_at"],
@@ -300,6 +381,10 @@ def _version_brief(v: dict) -> dict:
         "summary": v["result"].get("summary", {}),
         "reused": v.get("reused", False),
     }
+    # 仅有不确定度结果的版本才携带该键，旧版本响应保持原样
+    if v["result"].get("uncertainty") is not None:
+        brief["uncertainty"] = v["result"]["uncertainty"]
+    return brief
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -310,10 +395,21 @@ def create_app(db_path: str | None = None) -> FastAPI:
         description="将 Couder 遮罩分区读数还原为镜面/波前误差，支持版本化分析、"
         "读数冻结与剔除、批次对比、分区修正量搜索、Couder 遮罩方案设计"
         "（版本化布局、边界搜索、1:1 SVG）、上机往返测量会话"
-        "（逐笔校验、零点漂移/回程间隙校正、定稿冻结并生成测试批次），"
-        "以及子午线复测研究（4~16 份冻结版本的二次角向谐波拟合、"
-        "镜面/架位像散分离、留一稳定性、定稿冻结与复制追加）。",
+        "（逐笔校验、零点漂移/回程间隙校正、定稿冻结并生成测试批次）、"
+        "子午线复测研究（4~16 份冻结版本的二次角向谐波拟合、"
+        "镜面/架位像散分离、留一稳定性、定稿冻结与复制追加），"
+        "以及可追溯的不确定度传播（Monte Carlo：口径/曲率半径/波长/零位"
+        "标准不确定度、刀口尺量化误差、分区重复性，模型与随机种子随分析"
+        "版本冻结，修正量搜索可按置信分位评估候选）。",
     )
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_error(_, exc: RequestValidationError):
+        # 与默认处理相同的响应形状，仅将非有限浮点替换为字符串以便序列化
+        return JSONResponse(
+            status_code=422,
+            content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
+        )
 
     @app.exception_handler(NotFoundError)
     async def _not_found(_, exc: NotFoundError):
@@ -329,6 +425,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.exception_handler(CorrectionError)
     async def _correction_error(_, exc: CorrectionError):
+        return JSONResponse(status_code=422, content={"detail": {"message": str(exc)}})
+
+    @app.exception_handler(UncertaintyError)
+    async def _uncertainty_error(_, exc: UncertaintyError):
         return JSONResponse(status_code=422, content={"detail": {"message": str(exc)}})
 
     @app.exception_handler(MaskError)
@@ -416,6 +516,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
         errs += _validate_zones(
             mp["diameter"], zone_objs, payload.options.min_readings_per_zone
         )
+        errs += _validate_uncertainty_config(payload.uncertainty, len(mzones))
         if errs:
             raise _err(422, "测试数据校验失败", errs)
         zones = [
@@ -439,6 +540,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "options": payload.options.model_dump(),
             "mask_scheme_id": mv["scheme_id"],
             "mask_version_no": mv["version_no"],
+            "uncertainty": (
+                payload.uncertainty.model_dump() if payload.uncertainty else None
+            ),
         }
         test_id = db.create_test(record, zones)
         version = _run_analysis(db, test_id)
@@ -472,6 +576,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "（或提供 mask_scheme_id 引用遮罩版本）",
             )
         errs = _validate_payload(payload)
+        errs += _validate_uncertainty_config(
+            payload.uncertainty, len(payload.zones or [])
+        )
         if errs:
             raise _err(422, "测试数据校验失败", errs)
         factor = UNIT_TO_MM[payload.unit]
@@ -495,6 +602,9 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "wavelength_nm": payload.wavelength_nm,
             "instrument_offset": payload.instrument_offset * factor,
             "options": payload.options.model_dump(),
+            "uncertainty": (
+                payload.uncertainty.model_dump() if payload.uncertainty else None
+            ),
         }
         test_id = db.create_test(record, zones)
         version = _run_analysis(db, test_id)
@@ -590,9 +700,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.post("/api/tests/{test_id}/analyze", status_code=201)
     def analyze(test_id: int, payload: AnalyzeIn):
-        db.get_test(test_id)
+        test = db.get_test(test_id)
+        errs = _validate_uncertainty_config(payload.uncertainty, len(test["zones"]))
+        if errs:
+            raise _err(422, "不确定度配置校验失败", errs)
         options_dict = payload.options.model_dump() if payload.options else None
-        version = _run_analysis(db, test_id, options_dict)
+        uncertainty_dict = (
+            payload.uncertainty.model_dump() if payload.uncertainty else None
+        )
+        version = _run_analysis(db, test_id, options_dict, uncertainty_dict)
         return {"version": _version_brief(version)}
 
     @app.get("/api/tests/{test_id}/versions")
@@ -685,6 +801,42 @@ def create_app(db_path: str | None = None) -> FastAPI:
             else db.get_latest_version(test_id)
         )
         zones = v["result"]["zones"]
+        mc_residuals = None
+        unc_model = None
+        if payload.confidence_quantile is not None:
+            # 按置信分位评估：严格用该版本快照与冻结的不确定度模型/种子
+            # 重新传播逐轮分区残余（确定性，重复计算结果一致）
+            unc = v["result"].get("uncertainty")
+            if unc is None:
+                raise _err(
+                    422,
+                    f"分析版本 v{v['version_no']} 未冻结不确定度模型，"
+                    "无法按置信分位评估候选；请先提交 uncertainty 配置重新分析",
+                )
+            unc_model = unc["model"]
+            snap = v["snapshot"]
+            sc = snap["constants"]
+            constants = Constants(
+                diameter=sc["diameter"],
+                radius_of_curvature=sc["radius_of_curvature"],
+                conic_constant=sc["conic_constant"],
+                wavelength_nm=sc["wavelength_nm"],
+                source_mode=sc["source_mode"],
+                instrument_offset=sc["instrument_offset"],
+            )
+            zinputs = [
+                ZoneInput(
+                    inner=z["inner_radius"],
+                    outer=z["outer_radius"],
+                    readings=[
+                        r["value"] for r in z["readings"] if not r["excluded"]
+                    ],
+                )
+                for z in snap["zones"]
+            ]
+            mc_residuals = sample_zone_residuals(
+                constants, zinputs, _options_of(snap["options"]), unc_model
+            )
         try:
             result = search_corrections(
                 r_mean=[z["r_mean"] for z in zones],
@@ -699,10 +851,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 max_mean_removal_nm=payload.max_mean_removal_nm,
                 smoothing_weights=payload.smoothing_weights,
                 refit_defocus=payload.refit_defocus,
+                mc_zone_residuals_nm=mc_residuals,
+                confidence_quantile=payload.confidence_quantile,
             )
         except CorrectionError as exc:
             raise _err(422, str(exc)) from exc
         result["based_on"] = {"test_id": test_id, "version_no": v["version_no"]}
+        if unc_model is not None:
+            result["uncertainty_evaluation"] = {
+                "confidence_quantile": payload.confidence_quantile,
+                "n_samples": unc_model["n_samples"],
+                "seed": unc_model["seed"],
+            }
         return result
 
     # ---------------- Couder 遮罩方案 ----------------
