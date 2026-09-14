@@ -80,19 +80,20 @@ def test_build_plan_counts_and_directions():
 
 
 def test_correct_session_backlash_only():
-    # 3 区 × 1 重复，refresh=10：计划 = 锚点 + 正向3 + 反向3（扫掠内不插复测）
+    # 3 区 × 1 重复，refresh=10：计划 = 锚点 + 正向3 + 正末参考 + 反向3 + 反末参考
     plan = build_plan(3, 1, "forward", 0, 10)
-    assert len(plan) == 7
-    # seq: 1锚点 2-4正向(区0,1,2) 5-7反向(区2,1,0)；反向统一 +0.2 间隙
+    assert len(plan) == 9
+    # seq: 1锚点 2-4正向(区0,1,2) 5正末参考 6-8反向(区2,1,0) 9反末参考；
+    # 反向统一 +0.2 间隙；起始方向有锚点 + seq5 两个参考点（无漂移）
     raw = {
         1: (0.0, 1.0), 2: (1.0, 1.0), 3: (2.0, 2.0), 4: (3.0, 3.0),
-        5: (5.0, 3.2), 6: (6.0, 2.2), 7: (8.0, 1.2),
+        5: (4.0, 1.0),
+        6: (5.0, 3.2), 7: (6.0, 2.2), 8: (7.0, 1.2), 9: (8.0, 1.0),
     }
     rep = correct_session(plan, _fill(plan, raw), THRESHOLDS_OFF,
                           fit_direction=FORWARD)
-    # 仅一个参考观测 → 漂移不拟合（斜率 0），状态明确标注
-    assert rep["drift"]["status"] == "insufficient_reference"
-    assert rep["drift"]["slope_mm_per_s"] == 0.0
+    assert rep["drift"]["status"] == "ok"
+    assert rep["drift"]["slope_mm_per_s"] == pytest.approx(0.0, abs=1e-12)
     assert rep["backlash"]["global_mm"] == pytest.approx(0.2, abs=1e-9)
     for z in rep["zones"]:
         assert z["direction_diff_mm"] == pytest.approx(0.0, abs=1e-9)
@@ -103,8 +104,27 @@ def test_correct_session_backlash_only():
     assert rep["can_finalize"] is True
 
 
+def test_tail_guarantee_gives_two_start_direction_references():
+    # refresh 大于扫掠长度时，每遍扫掠末尾兜底参考点 → 起始方向 ≥2 点可拟合
+    plan = build_plan(3, 1, "forward", 0, 100)
+    start_refs = [
+        s for s in plan
+        if s["kind"] == "reference" and s["direction"] == FORWARD
+    ]
+    assert len(start_refs) == 2  # 锚点 + 正向扫掠末尾兜底
+    cur = {
+        s["seq"]: {"epoch": float(i), "value_mm": 1.0 + 0.01 * i,
+                   "locked": False}
+        for i, s in enumerate(plan)
+    }
+    rep = correct_session(plan, cur, THRESHOLDS_OFF, fit_direction=FORWARD)
+    assert not any(
+        v["type"] == "drift_underconstrained" for v in rep["violations"]
+    )
+
+
 def test_drift_correction_removes_linear_trend():
-    # refresh=3：正向参考点 = 锚点 + 各正向扫掠末尾复测，共 3 个，可拟合斜率
+    # refresh=3：正向参考点 = 锚点 + 正向扫掠末尾复测，共 2 个，可拟合斜率
     plan = build_plan(3, 1, "forward", 0, 3)
     slope = 0.01
     raw = {}
@@ -126,11 +146,14 @@ def test_missing_slots_block_and_are_named():
     rep = correct_session(plan, current, THRESHOLDS_OFF, fit_direction=FORWARD)
     assert rep["missing_seqs"] == [s["seq"] for s in plan]
     assert not rep["can_finalize"]
-    assert rep["blocking_violations"][0]["type"] == "missing"
+    types = [v["type"] for v in rep["blocking_violations"]]
+    assert types[0] == "missing"
+    assert "drift_underconstrained" in types
 
 
 def test_locked_violation_suppressed():
-    # 3 区，refresh=10：1锚点 2-4正向(区0,1,2) 5-7反向(区2,1,0)。
+    # 3 区，refresh=10（每扫掠末尾兜底参考点）：
+    # seq 1锚点 2-4正向(区0,1,2) 5正末参考 6-8反向(区2,1,0) 9反末参考。
     # 区0 反向偏到 1.9（该区全部锁定）；区1/2 正常 +0.5 回程，中位数取 0.5，
     # 校正后正常区无违例；区0 的离散度/方向差违例因全锁定被抑制。
     plan = build_plan(3, 1, "forward", 0, 10)
@@ -139,9 +162,11 @@ def test_locked_violation_suppressed():
         2: (1.0, 1.0, True),
         3: (2.0, 2.0, False),
         4: (3.0, 3.0, False),
-        5: (4.0, 3.5, False),
-        6: (5.0, 2.5, False),
-        7: (6.0, 1.9, True),
+        5: (4.0, 1.0, False),
+        6: (5.0, 3.5, False),
+        7: (6.0, 2.5, False),
+        8: (7.0, 1.9, True),
+        9: (8.0, 1.0, False),
     }
     rep = correct_session(
         plan, _fill(plan, raw),
@@ -164,9 +189,11 @@ def test_unlocked_violation_blocks():
         2: (1.0, 1.0),
         3: (2.0, 2.0),
         4: (3.0, 3.0),
-        5: (4.0, 3.5),
-        6: (5.0, 2.5),
-        7: (6.0, 1.9),
+        5: (4.0, 1.0),
+        6: (5.0, 3.5),
+        7: (6.0, 2.5),
+        8: (7.0, 1.9),
+        9: (8.0, 1.0),
     }
     rep = correct_session(
         plan, _fill(plan, raw),

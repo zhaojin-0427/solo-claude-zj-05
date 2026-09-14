@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException, Response
@@ -1040,9 +1040,14 @@ def create_app(db_path: str | None = None) -> FastAPI:
             options = AnalysisOptionsIn(
                 min_readings_per_zone=2 * payload.repeats_per_zone
             ).model_dump()
-        deadline = None
-        if payload.collect_deadline is not None:
-            deadline = iso_dt(payload.collect_deadline)
+        deadline = iso_dt(payload.collect_deadline)
+        collected_check = payload.collect_deadline
+        if collected_check.tzinfo is None:
+            collected_check = collected_check.replace(tzinfo=timezone.utc)
+        else:
+            collected_check = collected_check.astimezone(timezone.utc)
+        if collected_check <= datetime.now(timezone.utc):
+            raise _err(422, "采集时限必须晚于当前时间")
         record = {
             "name": payload.name,
             "notes": payload.notes,
@@ -1119,6 +1124,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
         session = db.get_session(session_id)
         _require_writable(session, payload.seq)
         slot = _slot_of(session, payload.seq)
+        current = _current_readings_map(session)
+        has_existing = current.get(payload.seq) is not None
+        expected = _next_expected_seq(session)
+        # 补测只允许两类测次：已有有效读数的测次（覆盖旧 attempt），
+        # 或当前应采测次（漏测后补在计划位置）。其他一律视为乱序。
+        if not has_existing and expected != payload.seq:
+            if expected is None:
+                raise _err(
+                    409,
+                    f"测次 #{payload.seq} 尚无读数，但计划已全部采集完毕；"
+                    "补测只能针对已有读数的测次",
+                )
+            raise _err(
+                409,
+                f"乱序补测：测次 #{payload.seq} 尚无读数，当前应采测次为 "
+                f"#{expected}，请先补该测次",
+            )
         # 锁定测位需先解锁才能补测（当前实现锁定即视为可信，不提供单独解锁）
         locked = [
             r for r in session["readings"]
@@ -1263,13 +1285,20 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.post("/api/sessions/{session_id}/finalize")
     def finalize_session(session_id: int):
         session = db.get_session(session_id)
-        # 幂等：已定稿重复定稿返回同一批次
+        # 幂等：已定稿（顺序或并发重复）返回同一批次
         if session["status"] == "finalized":
             return {
                 "session": _session_brief(session),
                 "test_id": session["test_id"],
                 "reused": True,
             }
+        # 定稿前必须先进入待确认状态（confirm 已做过阻断性检查）
+        if session["status"] != "confirmed":
+            raise _err(
+                409,
+                f"会话 {session_id} 当前为 {session['status']} 状态，"
+                "定稿前必须先调用 /confirm 进入待确认状态",
+            )
         report = _session_correction(session)
         if not report["can_finalize"]:
             raise _err(
@@ -1289,6 +1318,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
             zone_readings_mm.append(vals)
         freeze = _build_freeze_bundle(session, report, mv)
         input_hash = compute_input_hash(freeze)
+        freeze_str = json.dumps(freeze, sort_keys=True, ensure_ascii=True)
         record = {
             "name": session["name"] or f"会话 {session_id} 定稿批次",
             "notes": session["notes"],
@@ -1312,15 +1342,29 @@ def create_app(db_path: str | None = None) -> FastAPI:
             }
             for mz, vals in zip(mzones, zone_readings_mm)
         ]
+        # 建批次 → 分析 → 原子 CAS 翻转状态。并发请求只有一个能翻转成功；
+        # 落败者删除自己刚建的批次并返回胜出者的同一 test_id，不留孤儿。
         test_id = db.create_test(record, zones)
         try:
             version = _run_analysis(db, test_id)
         except Exception:
-            # 分析失败不留孤儿批次（会话仍可在修正数据后重新定稿）
             db.delete_test(test_id)
             raise
-        freeze_str = json.dumps(freeze, sort_keys=True, ensure_ascii=True)
-        db.finalize_session(session_id, input_hash, freeze_str, test_id)
+        outcome = db.finalize_session(session_id, input_hash, freeze_str, test_id)
+        if outcome["status"] != "finalized":
+            db.delete_test(test_id)
+            if outcome["status"] == "reused":
+                settled = db.get_session(session_id)
+                return {
+                    "session": _session_brief(settled),
+                    "test_id": outcome["test_id"],
+                    "reused": True,
+                }
+            # stale：会话在 confirm 之后又被改回采集中
+            raise _err(
+                409,
+                f"会话 {session_id} 在定稿前已离开待确认状态，请重新确认后再定稿",
+            )
         return {
             "session": _session_brief(db.get_session(session_id)),
             "test_id": test_id,

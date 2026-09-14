@@ -653,13 +653,32 @@ class Database:
         input_hash: str,
         freeze_json: str,
         test_id: int,
-    ) -> None:
-        """定稿：冻结哈希、关联测试批次、冻结全部原始读数（attempt 历史保留）。"""
+    ) -> dict:
+        """原子定稿：仅当会话仍处于非定稿状态时关联批次并冻结。
+
+        返回 {"status": ..., "test_id": ...}：
+        - "finalized"：本次完成状态翻转并冻结全部原始读数；
+        - "reused"：已被其他请求定稿（并发/重复），返回既有 test_id；
+        - "stale"：会话状态已被改动（不再是调用方预期的 confirmed）。
+
+        分析失败时由调用方先删除刚创建的批次，本方法不被调用，
+        因而不会留下无会话关联的孤儿批次。
+        """
         with self._lock:
+            row = self._conn.execute(
+                "SELECT status, test_id FROM measurement_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"测量会话 {session_id} 不存在")
+            if row["status"] == "finalized":
+                return {"status": "reused", "test_id": row["test_id"]}
+            if row["status"] != "confirmed":
+                return {"status": "stale", "test_id": None}
             self._conn.execute(
                 "UPDATE measurement_sessions SET status = 'finalized',"
                 " input_hash = ?, freeze_json = ?, finalized_at = ?, test_id = ?"
-                " WHERE id = ?",
+                " WHERE id = ? AND status = 'confirmed'",
                 (input_hash, freeze_json, _now(), test_id, session_id),
             )
             self._conn.execute(
@@ -667,3 +686,4 @@ class Database:
                 (session_id,),
             )
             self._conn.commit()
+            return {"status": "finalized", "test_id": test_id}

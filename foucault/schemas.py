@@ -180,7 +180,7 @@ class SessionCreateIn(BaseModel):
     start_direction: Direction = "forward"
     reference_zone_index: int = Field(default=0, ge=0)
     reference_refresh: int = Field(default=2, ge=1)  # 每 N 个常规测位穿插一次参考复测
-    collect_deadline: datetime | None = None  # 采集时限；naive 按 UTC
+    collect_deadline: datetime  # 采集时限，必填；naive 按 UTC
     wavelength_nm: float = Field(gt=0)
     instrument_offset: float = 0.0
     thresholds: SessionThresholdsIn = Field(default_factory=SessionThresholdsIn)

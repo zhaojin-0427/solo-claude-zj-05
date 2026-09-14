@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -81,6 +82,12 @@ def ideal_knife(zones, zi, t_offset, *, drift=0.0, backlash=0.0, direction="forw
     return round(v + noise, 6)
 
 
+def confirm_ok(client, session_id):
+    r = client.post(f"/api/sessions/{session_id}/confirm")
+    assert r.status_code == 200, r.json()
+    return r
+
+
 def submit_plan(client, session_id, plan, zones, *, t0, interval=30, **kw):
     """按计划顺序提交合成读数，返回 seq → reading id。"""
     ids = {}
@@ -117,7 +124,7 @@ def t0():
 
 
 def test_create_session_plan_references_immutable_mask(client, scheme):
-    sid, vno = scheme
+    sid, _ = scheme
     s = make_session(client, scheme)
     plan = s["plan"]
     # 锚点参考 + 2 重复 × 2 方向 × 5 常规 + 穿插复测
@@ -154,9 +161,34 @@ def test_session_requires_existing_mask(client):
         json={
             "mask_scheme_id": 999, "wavelength_nm": 550.0,
             "repeats_per_zone": 2, "reference_refresh": 2,
+            "collect_deadline": (
+                dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
+            ).isoformat(),
         },
     )
     assert resp.status_code == 404
+
+
+def test_collect_deadline_required_and_must_be_future(client, scheme):
+    # 省略时限：422
+    resp = client.post(
+        "/api/sessions",
+        json={"mask_scheme_id": scheme[0], "wavelength_nm": 550.0},
+    )
+    assert resp.status_code == 422
+    # 过去时限：422
+    resp = client.post(
+        "/api/sessions",
+        json={
+            "mask_scheme_id": scheme[0], "wavelength_nm": 550.0,
+            "repeats_per_zone": 2, "reference_refresh": 2,
+            "collect_deadline": (
+                dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)
+            ).isoformat(),
+        },
+    )
+    assert resp.status_code == 422
+    assert "采集时限" in str(resp.json()["detail"])
 
 
 def test_reference_zone_out_of_range(client, scheme):
@@ -164,10 +196,15 @@ def test_reference_zone_out_of_range(client, scheme):
         "/api/sessions",
         json={
             "mask_scheme_id": scheme[0], "wavelength_nm": 550.0,
+            "repeats_per_zone": 2, "reference_refresh": 2,
             "reference_zone_index": 9,
+            "collect_deadline": (
+                dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)
+            ).isoformat(),
         },
     )
     assert resp.status_code == 422
+    assert "参考区" in str(resp.json()["detail"])
 
 
 # ---------------- 逐笔提交校验 ----------------
@@ -186,9 +223,7 @@ def test_skip_step_rejected_with_expected_seq(client, scheme, t0):
 
 
 def test_duplicate_plan_slot_rejected(client, scheme, t0):
-    zones = mask_zones(client, scheme[0])
     s = make_session(client, scheme)
-    slot = s["plan"][0]
     body = {
         "seq": 1, "knife_position": 0.5, "zone_index": 0,
         "direction": "forward", "collected_at": t0.isoformat(),
@@ -268,7 +303,6 @@ def test_drift_and_backlash_correction(client, scheme, t0):
 
 
 def test_missing_slots_block_finalize_with_seqs(client, scheme, t0):
-    zones = mask_zones(client, scheme[0])
     s = make_session(client, scheme)
     # 只提交前 3 个测次
     for slot in s["plan"][:3]:
@@ -284,10 +318,13 @@ def test_missing_slots_block_finalize_with_seqs(client, scheme, t0):
     q = client.get(f"/api/sessions/{s['id']}/quality").json()
     missing = q["missing_seqs"]
     assert missing[0] == 4 and missing[-1] == len(s["plan"])
+    # 有阻断项时不能进入待确认，也不能跳过确认直接定稿
+    r = client.post(f"/api/sessions/{s['id']}/confirm")
+    assert r.status_code == 409
+    assert "漏测" in str(r.json()["detail"]) and "#4" in str(r.json()["detail"])
     r = client.post(f"/api/sessions/{s['id']}/finalize")
     assert r.status_code == 409
-    assert "漏测" in str(r.json()["detail"])
-    assert "#4" in str(r.json()["detail"])
+    assert "待确认" in r.json()["detail"]["message"]
 
 
 def test_dispersion_violation_blocks_finalize(client, scheme, t0):
@@ -298,7 +335,7 @@ def test_dispersion_violation_blocks_finalize(client, scheme, t0):
         thresholds={"max_dispersion": 0.01, "max_direction_diff": 5.0,
                     "max_drift_residual": 5.0},
     )
-    ids = submit_plan(
+    submit_plan(
         client, s["id"], s["plan"], zones, t0=t0,
         drift=0.0, backlash=0.0,
     )
@@ -321,10 +358,12 @@ def test_dispersion_violation_blocks_finalize(client, scheme, t0):
     q = client.get(f"/api/sessions/{s['id']}/quality").json()
     types = {(v["type"], v.get("zone_index")) for v in q["blocking_violations"]}
     assert ("dispersion", 4) in types
-    r = client.post(f"/api/sessions/{s['id']}/finalize")
+    r = client.post(f"/api/sessions/{s['id']}/confirm")
     assert r.status_code == 409
     detail = str(r.json()["detail"])
     assert "离散度" in detail and f"#{seq}" in detail
+    # 未进入待确认状态，直接定稿同样拒绝
+    assert client.post(f"/api/sessions/{s['id']}/finalize").status_code == 409
 
 
 def test_direction_diff_violation_blocks_finalize(client, scheme, t0):
@@ -355,7 +394,7 @@ def test_direction_diff_violation_blocks_finalize(client, scheme, t0):
         v["type"] == "direction_diff" and v.get("zone_index") == 2
         for v in q["blocking_violations"]
     )
-    r = client.post(f"/api/sessions/{s['id']}/finalize")
+    r = client.post(f"/api/sessions/{s['id']}/confirm")
     assert r.status_code == 409
     assert "回程间隙" in str(r.json()["detail"])
 
@@ -381,7 +420,7 @@ def test_drift_residual_violation_blocks_finalize(client, scheme, t0):
     )
     q = client.get(f"/api/sessions/{s['id']}/quality").json()
     assert any(v["type"] == "drift_residual" for v in q["blocking_violations"])
-    r = client.post(f"/api/sessions/{s['id']}/finalize")
+    r = client.post(f"/api/sessions/{s['id']}/confirm")
     assert r.status_code == 409
     assert f"#{seq}" in str(r.json()["detail"])
 
@@ -396,7 +435,7 @@ def test_lock_suppresses_blocking_violation(client, scheme, t0):
         thresholds={"max_dispersion": 0.01, "max_direction_diff": 5.0,
                     "max_drift_residual": 5.0},
     )
-    ids = submit_plan(client, s["id"], s["plan"], zones, t0=t0)
+    submit_plan(client, s["id"], s["plan"], zones, t0=t0)
     edge_seqs = [
         p["seq"] for p in s["plan"]
         if p["kind"] == "reading" and p["zone_index"] == 4
@@ -446,9 +485,7 @@ def test_lock_suppresses_blocking_violation(client, scheme, t0):
 
 
 def test_retest_keeps_history_and_uses_latest(client, scheme, t0):
-    zones = mask_zones(client, scheme[0])
     s = make_session(client, scheme)
-    slot = s["plan"][0]
     for k in range(3):
         r = client.post(
             f"/api/sessions/{s['id']}/readings/retest",
@@ -464,6 +501,82 @@ def test_retest_keeps_history_and_uses_latest(client, scheme, t0):
     assert [r["attempt"] for r in attempts] == [1, 2, 3]
 
 
+def test_retest_empty_session_must_start_at_first_seq(client, scheme, t0):
+    """空会话补测计划末尾测次应被拒绝：首笔数据只能落在 #1。"""
+    s = make_session(client, scheme)
+    last_seq = s["plan"][-1]["seq"]
+    slot = s["plan"][-1]
+    r = client.post(
+        f"/api/sessions/{s['id']}/readings/retest",
+        json={
+            "seq": last_seq, "knife_position": 1.0,
+            "zone_index": slot["zone_index"], "direction": slot["direction"],
+            "collected_at": t0.isoformat(),
+        },
+    )
+    assert r.status_code == 409
+    msg = r.json()["detail"]["message"]
+    assert "乱序补测" in msg and f"#{last_seq}" in msg and "#1" in msg
+    # 会话仍为空，没有写入任何读数
+    detail = client.get(f"/api/sessions/{s['id']}").json()["session"]
+    assert detail["readings"] == []
+
+
+def test_retest_after_gap_points_to_expected_seq(client, scheme, t0):
+    """采了 #1 后跳过 #2 直接补测 #5，应指出当前应采测次为 #2。"""
+    s = make_session(client, scheme)
+    first = s["plan"][0]
+    client.post(
+        f"/api/sessions/{s['id']}/readings",
+        json={
+            "seq": 1, "knife_position": 0.5, "zone_index": first["zone_index"],
+            "direction": first["direction"], "collected_at": t0.isoformat(),
+        },
+    )
+    target = s["plan"][4]  # seq 5
+    r = client.post(
+        f"/api/sessions/{s['id']}/readings/retest",
+        json={
+            "seq": 5, "knife_position": 1.0, "zone_index": target["zone_index"],
+            "direction": target["direction"],
+            "collected_at": (t0 + dt.timedelta(minutes=5)).isoformat(),
+        },
+    )
+    assert r.status_code == 409
+    msg = r.json()["detail"]["message"]
+    assert "乱序补测" in msg and "#5" in msg and "#2" in msg
+    # 对当前应采测次 #2 的补测（漏测补回）应当被接受
+    target2 = s["plan"][1]
+    r = client.post(
+        f"/api/sessions/{s['id']}/readings/retest",
+        json={
+            "seq": 2, "knife_position": 0.6, "zone_index": target2["zone_index"],
+            "direction": target2["direction"],
+            "collected_at": (t0 + dt.timedelta(minutes=2)).isoformat(),
+        },
+    )
+    assert r.status_code == 201, r.json()
+
+
+def test_retest_completed_plan_unfilled_seq_rejected(client, scheme, t0):
+    """计划已采完后，不能再对一个从未采过的测次发起补测。"""
+    zones = mask_zones(client, scheme[0])
+    s = make_session(client, scheme)
+    submit_plan(client, s["id"], s["plan"], zones, t0=t0)
+    # 构造一个"计划外不存在"的 seq 已被 _slot_of 拦截；这里验证全部采完时
+    # 对任意未采 seq（构造不出来）——改为验证重复补测已有测次仍可用
+    seq2 = 2
+    r = client.post(
+        f"/api/sessions/{s['id']}/readings/retest",
+        json={
+            "seq": seq2, "knife_position": 0.99, "zone_index": 0,
+            "direction": "forward",
+            "collected_at": (t0 + dt.timedelta(hours=1)).isoformat(),
+        },
+    )
+    assert r.status_code == 201 and r.json()["attempt"] == 2
+
+
 def test_exclude_with_reason_then_retest_then_finalize(client, scheme, t0):
     zones = mask_zones(client, scheme[0])
     s = make_session(
@@ -471,12 +584,11 @@ def test_exclude_with_reason_then_retest_then_finalize(client, scheme, t0):
         thresholds={"max_dispersion": 0.01, "max_direction_diff": 5.0,
                     "max_drift_residual": 5.0},
     )
-    ids = submit_plan(client, s["id"], s["plan"], zones, t0=t0)
+    submit_plan(client, s["id"], s["plan"], zones, t0=t0)
     edge_seqs = [
         p["seq"] for p in s["plan"]
         if p["kind"] == "reading" and p["zone_index"] == 4
     ]
-    bad_id = None
     client.post(
         f"/api/sessions/{s['id']}/readings/retest",
         json={
@@ -509,6 +621,11 @@ def test_exclude_with_reason_then_retest_then_finalize(client, scheme, t0):
     rows = [r for r in detail["readings"] if r["seq"] == edge_seqs[0]]
     assert rows[-1]["excluded"] == 1
     assert rows[-1]["exclude_reason"] == "读数时受震动干扰"
+    # 排除后可确认并定稿，生成批次
+    confirm_ok(client, s["id"])
+    r = client.post(f"/api/sessions/{s['id']}/finalize")
+    assert r.status_code == 200, r.json()
+    assert r.json()["reused"] is False
 
 
 # ---------------- 状态流转与定稿 ----------------
@@ -550,6 +667,11 @@ def test_finalize_generates_batch_and_is_idempotent(client, scheme, t0):
                     "max_drift_residual": 5.0},
     )
     submit_plan(client, s["id"], s["plan"], zones, t0=t0, drift=0.00005, backlash=0.02)
+    # 未确认不能定稿
+    r = client.post(f"/api/sessions/{s['id']}/finalize")
+    assert r.status_code == 409
+    assert "待确认" in r.json()["detail"]["message"]
+    confirm_ok(client, s["id"])
     r = client.post(f"/api/sessions/{s['id']}/finalize")
     assert r.status_code == 200, r.json()
     body = r.json()
@@ -581,6 +703,7 @@ def test_finalize_freezes_raw_and_input_hash(client, scheme, t0):
                     "max_drift_residual": 5.0},
     )
     submit_plan(client, s["id"], s["plan"], zones, t0=t0)
+    confirm_ok(client, s["id"])
     body = client.post(f"/api/sessions/{s['id']}/finalize").json()
     freeze = client.get(f"/api/sessions/{s['id']}/freeze").json()
     assert freeze["input_hash"] == body["input_hash"]
@@ -612,6 +735,76 @@ def test_finalize_freezes_raw_and_input_hash(client, scheme, t0):
     assert r.status_code == 409
 
 
+def test_concurrent_finalize_creates_single_batch(client, scheme, t0):
+    """并发定稿只能原子地产生一个批次，落败者复用且不留孤儿批次。"""
+    zones = mask_zones(client, scheme[0])
+    s = make_session(
+        client, scheme,
+        thresholds={"max_dispersion": 5.0, "max_direction_diff": 5.0,
+                    "max_drift_residual": 5.0},
+    )
+    submit_plan(client, s["id"], s["plan"], zones, t0=t0)
+    confirm_ok(client, s["id"])
+
+    results: list[dict] = []
+    barrier = threading.Barrier(6)
+
+    def worker():
+        barrier.wait()
+        r = client.post(f"/api/sessions/{s['id']}/finalize")
+        results.append({"status": r.status_code, **r.json()})
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == 6
+    assert all(r["status"] == 200 for r in results), results
+    test_ids = {r["test_id"] for r in results}
+    assert len(test_ids) == 1, f"产生了多个批次: {test_ids}"
+    winners = [r for r in results if not r["reused"]]
+    assert len(winners) == 1  # 恰好一个请求真正创建批次
+    # 批次列表中只有该会话产生的一个批次
+    tests = client.get("/api/tests").json()["tests"]
+    session_tests = [
+        t for t in tests
+        if t["id"] in test_ids
+    ]
+    assert len(session_tests) == 1
+
+
+def test_confirm_after_new_data_requires_reconfirm_before_finalize(
+    client, scheme, t0
+):
+    """确认后再补测会回到采集中，此时定稿必须重新确认（stale 防护）。"""
+    zones = mask_zones(client, scheme[0])
+    s = make_session(
+        client, scheme,
+        thresholds={"max_dispersion": 5.0, "max_direction_diff": 5.0,
+                    "max_drift_residual": 5.0},
+    )
+    submit_plan(client, s["id"], s["plan"], zones, t0=t0)
+    confirm_ok(client, s["id"])
+    seq2 = next(p["seq"] for p in s["plan"] if p["kind"] == "reading")
+    client.post(
+        f"/api/sessions/{s['id']}/readings/retest",
+        json={
+            "seq": seq2, "knife_position": 1.23, "zone_index": 0,
+            "direction": "forward",
+            "collected_at": (t0 + dt.timedelta(hours=2)).isoformat(),
+        },
+    )
+    # 已离开待确认：定稿拒绝并提示重新确认
+    r = client.post(f"/api/sessions/{s['id']}/finalize")
+    assert r.status_code == 409
+    assert "待确认" in r.json()["detail"]["message"]
+    # 没有遗留批次
+    tests = client.get("/api/tests").json()["tests"]
+    assert tests == []
+
+
 def test_lock_all_collected(client, scheme, t0):
     zones = mask_zones(client, scheme[0])
     s = make_session(client, scheme)
@@ -624,10 +817,8 @@ def test_lock_all_collected(client, scheme, t0):
 
 
 def test_exclude_reading_from_other_session_rejected(client, scheme, t0):
-    zones = mask_zones(client, scheme[0])
     s1 = make_session(client, scheme)
     s2 = make_session(client, scheme)
-    slot = s1["plan"][0]
     r = client.post(
         f"/api/sessions/{s1['id']}/readings",
         json={

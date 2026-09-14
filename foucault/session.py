@@ -69,6 +69,10 @@ def build_plan(
     每个 slot：{seq, kind('reading'|'reference'), zone_index, trial, sweep,
     direction}。锚点参考观测 trial/sweep 记为 0；常规测位每区每方向各
     repeats_per_zone 次（每区合计 2·repeats 次有效读数）。
+
+    参考复测每 reference_refresh 个常规测位穿插一次；无论该频率多大，
+    每遍扫掠末尾保证再补一次，使任一方向都有 ≥2 个参考点（锚点 + 复测），
+    足以拟合该方向上的线性漂移。
     """
     if zone_count < 2:
         raise SessionError("遮罩至少需要两个分区才能建立往返测量计划")
@@ -111,11 +115,17 @@ def build_plan(
                 else range(zone_count - 1, -1, -1)
             )
             since_ref = 0
+            added_in_sweep = False
             for zi in order:
                 add("reading", zi, trial, sweep, direction)
                 since_ref += 1
                 if since_ref % reference_refresh == 0:
                     add("reference", reference_zone_index, trial, sweep, direction)
+                    since_ref = 0
+                    added_in_sweep = True
+            # 每遍扫掠至少一次参考复测（refresh 大于扫掠长度等情况下兜底）
+            if not added_in_sweep:
+                add("reference", reference_zone_index, trial, sweep, direction)
     return slots
 
 
@@ -220,8 +230,10 @@ def correct_session(
     drift = fit_drift(fit_obs)
     if len(preferred) >= 2:
         drift["fit_observations"] = "start_direction"
-    elif ref_all:
+    elif len(ref_all) >= 2:
         drift["fit_observations"] = "all_directions"
+    elif ref_all:
+        drift["fit_observations"] = "insufficient"
     else:
         drift["fit_observations"] = "none"
     t0 = drift["t0_epoch"]
@@ -246,7 +258,7 @@ def correct_session(
         interim.append((slot["seq"], slot["zone_index"], slot["direction"], v,
                         bool(r.get("locked"))))
 
-    # 3) 回程间隙：各区反向均值 − 正向均值，全局取平均
+    # 3) 回程间隙：各区反向均值 − 正向均值，全局取中位数（对单区异常稳健）
     per_zone_backlash = []
     diffs = []
     for zi, g in enumerate(groups):
@@ -316,6 +328,10 @@ def correct_session(
         s["seq"] for s in plan if current.get(s["seq"]) is None
     ]
     violations: list[dict] = []
+
+    def _seqs_str(seqs: list[int]) -> str:
+        return "、".join(f"#{n}" for n in seqs)
+
     if missing_seqs:
         seqs = ", ".join(f"#{n}" for n in missing_seqs)
         violations.append(
@@ -327,8 +343,25 @@ def correct_session(
             }
         )
 
-    def _seqs_str(seqs: list[int]) -> str:
-        return "、".join(f"#{n}" for n in seqs)
+    # 防御：起始方向上参考点不足 2 个则无法拟合线性漂移（正常计划每扫掠至少
+    # 一次复测，加上锚点必然满足；此违例保护旧数据/手工构造的计划）
+    if len(preferred) < 2:
+        ref_seqs = sorted(o["seq"] for o in ref_all if o["direction"] == fit_direction)
+        if ref_seqs:
+            detail = f"（起始方向 {fit_direction} 仅有参考点 {_seqs_str(ref_seqs)}）"
+        else:
+            detail = f"（起始方向 {fit_direction} 无任何参考观测）"
+        violations.append(
+            {
+                "type": "drift_underconstrained",
+                "seqs": ref_seqs,
+                "message": (
+                    "穿插参考点不足，无法拟合零点线性漂移：至少需要起始方向上"
+                    "2 个参考观测（锚点 + 一次复测）" + detail
+                ),
+                "locked_suppressed": False,
+            }
+        )
 
     disp_lim = thresholds.get("max_dispersion_mm")
     dir_lim = thresholds.get("max_direction_diff_mm")
